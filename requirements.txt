@@ -1,0 +1,3 @@
+# FusionDetector runtime dependencies (inferred from codebase)
+pysam
+intervaltree

@@ -32,11 +32,11 @@ class FusionValidator:
         if g1 == g2 or g1[:4] == g2[:4]:
             return True
 
-        # 2. Intra-chromosomal Neighbor Filter (1MB)
+        # 2. Intra-chromosomal Neighbor Filter (500KB)
         if chrom_a == chrom_b:
             try:
                 dist = abs(int(pos_a) - int(pos_b))
-                if dist < 500000: #500KB
+                if dist < 500000:  # 500KB: likely neighbor/read-through
                     return True
             except (ValueError, TypeError):
                 pass

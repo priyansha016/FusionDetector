@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+Test/
+hg19.p13.plusMT.no_alt_analysis_set.bwa_index.tar.gz
+hg19.p13.plusMT.no_alt_analysis_set/
