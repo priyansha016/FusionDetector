@@ -50,9 +50,8 @@ class FusionAssembler:
         use_b = other_chr_sa if other_chr_sa else evidence_b_other_chr
         chrom_b = Counter(c for c, _ in use_b).most_common(1)[0][0]
 
-        # Same-chromosome: two clusters or one cluster + noise (e.g. ALK-EML4 real at 29Mb, noise at 42Mb)
+        # Same-chromosome: two distinct breakpoint clusters (e.g. ALK ~29Mb, EML4 ~42Mb on chr2)
         MIN_CLUSTER_GAP = 1_000_000   # 1 Mb
-        NOISE_CLUSTER_GAP = 5_000_000  # gap > 5 Mb: smaller cluster likely noise, use dominant only
         if chrom_a == chrom_b:
             all_a = [p for c, p in (evidence_a_sa if evidence_a_sa else evidence_a) if c == chrom_a]
             all_b = [p for c, p in evidence_b_sa if c == chrom_b] or [p for c, p in evidence_b if c == chrom_b]
@@ -62,23 +61,14 @@ class FusionAssembler:
                 gap_size, split_at = max(gaps, key=lambda x: x[0])
                 if gap_size >= MIN_CLUSTER_GAP:
                     left, right = combined[:split_at], combined[split_at:]
-                    # Very large gap + one cluster much smaller => treat smaller as noise (e.g. ALK-EML4 29Mb vs 42Mb)
-                    if gap_size > NOISE_CLUSTER_GAP and (len(left) >= 3 * len(right) or len(right) >= 3 * len(left)):
-                        use = left if len(left) >= len(right) else right
-                        med_use = self._consensus_pos(use)
-                        within = 2_000_000
-                        a_near = [p for p in all_a if abs(p - med_use) <= within] or all_a
-                        b_near = [p for p in all_b if abs(p - med_use) <= within] or all_b
-                        bp_a = (chrom_a, self._consensus_pos(a_near))
-                        bp_b = (chrom_b, self._consensus_pos(b_near))
+                    med_left = self._consensus_pos(left)
+                    med_right = self._consensus_pos(right)
+                    # Assign bp_a to cluster with more evidence_a, bp_b to the other (so we get two distinct positions)
+                    n_a_left = sum(1 for p in all_a if abs(p - med_left) <= abs(p - med_right))
+                    if n_a_left >= len(all_a) / 2:
+                        bp_a, bp_b = (chrom_a, med_left), (chrom_b, med_right)
                     else:
-                        med_left = self._consensus_pos(left)
-                        med_right = self._consensus_pos(right)
-                        n_a_left = sum(1 for p in all_a if abs(p - med_left) <= abs(p - med_right))
-                        if n_a_left >= len(all_a) / 2:
-                            bp_a, bp_b = (chrom_a, med_left), (chrom_b, med_right)
-                        else:
-                            bp_a, bp_b = (chrom_a, med_right), (chrom_b, med_left)
+                        bp_a, bp_b = (chrom_a, med_right), (chrom_b, med_left)
                     return (bp_a, bp_b), len(reads)
 
         # Default: primary vs other (and for same-chr with no clear gap, use original logic)

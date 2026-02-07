@@ -1,6 +1,12 @@
 import collections
 import gzip
+import re
 from intervaltree import IntervalTree
+
+def _normalize_chrom(chrom):
+    """Strip leading chr/Chr so 'chr2', 'Chr2', '2' all become '2'."""
+    s = str(chrom).strip()
+    return re.sub(r'^[Cc]hr', '', s) if s else s
 
 class GenomeIndex:
     def __init__(self):
@@ -18,7 +24,7 @@ class GenomeIndex:
                 if len(parts) < 6: continue
                 
                 gene_name = parts[0]
-                chrom = parts[2].replace('chr', '')
+                chrom = _normalize_chrom(parts[2])
                 start = int(parts[4])
                 end = int(parts[5])
                 
@@ -30,12 +36,11 @@ class GenomeIndex:
         print(f"[*] Loaded {count} gene intervals into memory.")
 
     def get_gene_at(self, chrom, pos):
-        clean_chrom = str(chrom).replace('chr', '')
+        clean_chrom = _normalize_chrom(chrom)
         matches = self.trees[clean_chrom][pos]
         
         # Extract unique gene names from the data field of the matches
         return list(set(m.data for m in matches if m.data))
 
     def is_known_chrom(self, chrom):
-        clean_chrom = str(chrom).replace('chr', '')
-        return clean_chrom in self.trees
+        return _normalize_chrom(chrom) in self.trees
