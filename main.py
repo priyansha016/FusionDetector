@@ -28,7 +28,7 @@ def process_sample(bam_path, idx, validator, output_dir, user_targets, n_workers
                 print(f"[*] ALK-EML4 in discovery: {len(reads)} reads", flush=True)
                 break
         if alk_eml4_reads is None:
-            print(f"[*] ALK-EML4 not in discovery (0 reads). Try --min-mapq 10 or run scripts/check_bam_fusion.py on this BAM.", flush=True)
+            print(f"[*] ALK-EML4 not in discovery (0 reads). Try --min-mapq 0 and run: python scripts/check_bam_fusion.py <BAM> --ref <refFlat>", flush=True)
 
         assembler = FusionAssembler(bam_path)
         final_results = []
@@ -55,15 +55,11 @@ def process_sample(bam_path, idx, validator, output_dir, user_targets, n_workers
                 # 3. ASSEMBLE BREAKPOINT
                 breakpoints, support = assembler.find_breakpoint(reads, bam=bam_handle)
 
-                is_alk_eml4 = {g_a, g_b} == {'ALK', 'EML4'}
-                min_support = 1 if is_alk_eml4 else 2  # allow single-read for truth-set ALK-EML4
-                if is_alk_eml4 and (not breakpoints or support < 1):
-                    print(f"[*] ALK-EML4 dropped: breakpoints={breakpoints is not None}, support={support}", flush=True)
-
+                min_support = 20  # require support >= 20 reads for all fusions
                 if breakpoints and support >= min_support:
                     bp_a, bp_b = breakpoints
 
-                    # 4. VALIDATION LOGIC
+                    # 4. VALIDATION LOGIC (target genes bypass validator; others use full validator)
                     if is_target_match:
                         final_results.append({
                             'sample': sample_name,
@@ -72,10 +68,7 @@ def process_sample(bam_path, idx, validator, output_dir, user_targets, n_workers
                             'support': support
                         })
                     else:
-                        if validator.is_likely_fp(g_a, g_b, bp_a[0], bp_b[0], bp_a[1], bp_b[1]):
-                            if is_alk_eml4:
-                                print(f"[*] ALK-EML4 dropped by validator (is_likely_fp)", flush=True)
-                        else:
+                        if not validator.is_likely_fp(g_a, g_b, bp_a[0], bp_b[0], bp_a[1], bp_b[1]):
                             context = validator.get_sequence_context(bp_a[0], bp_a[1])
                             final_results.append({
                                 'sample': sample_name,

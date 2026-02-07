@@ -28,6 +28,10 @@ def main():
     idx = GenomeIndex()
     idx.load_refflat(args.ref)
 
+    with pysam.AlignmentFile(args.bam, "rb") as sam:
+        refs_preview = list(sam.references)[:5]
+    print(f"BAM reference names (first 5): {refs_preview}")
+
     sa_eml4_alk = 0
     discordant_eml4_alk = 0
     sa_any = 0
