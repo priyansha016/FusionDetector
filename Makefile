@@ -10,7 +10,7 @@ OUTDIR := Test/results
 CORES  ?= 6
 THREADS := $(CORES)
 
-BAMS := Test/SRR948904.bam Test/SRR25536655.bam Test/SRR25536660.bam Test/HorizonDx_HD753.bam
+BAMS := Test/SRR948904.bam Test/SRR25536655.bam Test/SRR25536660.bam Test/HorizonDx_HD753.bam Test/H3122.bam
 
 .PHONY: all index $(BAMS)
 
@@ -20,6 +20,7 @@ index:
 	samtools index Test/SRR25536655.bam
 	samtools index Test/SRR25536660.bam
 	samtools index Test/HorizonDx_HD753.bam
+	samtools index Test/H3122.bam
 
 all: $(BAMS)
 
@@ -36,8 +37,16 @@ Test/SRR25536660.bam:
 Test/HorizonDx_HD753.bam:
 	python main.py --input Test/HorizonDx_HD753.bam --ref $(REF) --fasta $(FASTA) --outdir $(OUTDIR) $(if $(THREADS),--cores $(THREADS),)
 
+Test/H3122.bam:
+	python main.py --input Test/H3122.bam --ref $(REF) --fasta $(FASTA) --outdir $(OUTDIR) $(if $(THREADS),--cores $(THREADS),)
+
+# Run H3122 and check ALK-EML4 breakpoints vs truth (chr2:29446607, chr2:42526889)
+check-H3122: Test/H3122.bam
+	python scripts/check_breakpoints.py $(OUTDIR)/H3122_fusions.tsv --truth scripts/truth_H3122.txt --tolerance 100
+
 # Convenience targets by sample name (run e.g. make SRR948904)
 SRR948904:       Test/SRR948904.bam
 SRR25536655:     Test/SRR25536655.bam
 SRR25536660:     Test/SRR25536660.bam
 HorizonDx_HD753: Test/HorizonDx_HD753.bam
+H3122: Test/H3122.bam

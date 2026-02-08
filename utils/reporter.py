@@ -20,8 +20,12 @@ class FusionReporter:
             writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
             writer.writeheader()
             for row in results:
-                # Ensure we only write keys that exist in our fieldnames
-                filtered_row = {k: v for k, v in row.items() if k in fieldnames}
-                writer.writerow(filtered_row)
+                # Report positions in 1-based coordinates (genomics standard; assembler uses 0-based)
+                out = {k: v for k, v in row.items() if k in fieldnames}
+                if 'pos_a' in out and out['pos_a'] is not None:
+                    out['pos_a'] = int(out['pos_a']) + 1
+                if 'pos_b' in out and out['pos_b'] is not None:
+                    out['pos_b'] = int(out['pos_b']) + 1
+                writer.writerow(out)
                 
         print(f"[*] Report saved: {self.output_path}")

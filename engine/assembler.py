@@ -50,11 +50,15 @@ class FusionAssembler:
         use_b = other_chr_sa if other_chr_sa else evidence_b_other_chr
         chrom_b = Counter(c for c, _ in use_b).most_common(1)[0][0]
 
+        # Prefer split-read (SA) evidence for breakpoint positions; discordant mates give fragment ends, not junction (Factera/JuLI use clip boundaries)
+        use_a_for_bp = evidence_a_sa if evidence_a_sa else evidence_a
+        use_b_for_bp = evidence_b_sa if evidence_b_sa else evidence_b
+
         # Same-chromosome: two distinct breakpoint clusters (e.g. ALK ~29Mb, EML4 ~42Mb on chr2)
         MIN_CLUSTER_GAP = 1_000_000   # 1 Mb
         if chrom_a == chrom_b:
-            all_a = [p for c, p in (evidence_a_sa if evidence_a_sa else evidence_a) if c == chrom_a]
-            all_b = [p for c, p in evidence_b_sa if c == chrom_b] or [p for c, p in evidence_b if c == chrom_b]
+            all_a = [p for c, p in use_a_for_bp if c == chrom_a]
+            all_b = [p for c, p in use_b_for_bp if c == chrom_b]
             combined = sorted(all_a + all_b)
             if len(combined) >= 2:
                 gaps = [(combined[i + 1] - combined[i], i + 1) for i in range(len(combined) - 1)]
@@ -71,23 +75,52 @@ class FusionAssembler:
                         bp_a, bp_b = (chrom_a, med_right), (chrom_b, med_left)
                     return (bp_a, bp_b), len(reads)
 
-        # Default: primary vs other (and for same-chr with no clear gap, use original logic)
-        pos_a_sa = [p for c, p in evidence_a_sa if c == chrom_a]
-        pos_a = self._consensus_pos(pos_a_sa if pos_a_sa else [p for c, p in use_a if c == chrom_a])
+        # Default: use split-read positions only when available (so breakpoints are junction boundaries, not mate fragment ends)
+        pos_a_candidates = [p for c, p in use_a_for_bp if c == chrom_a]
+        pos_b_candidates = [p for c, p in use_b_for_bp if c == chrom_b]
+        pos_a = self._consensus_pos(pos_a_candidates)
+        pos_b = self._consensus_pos(pos_b_candidates)
         bp_a = (chrom_a, pos_a)
-        pos_b_sa = [p for c, p in evidence_b_sa if c == chrom_b]
-        pos_b = self._consensus_pos(pos_b_sa if pos_b_sa else [p for c, p in use_b if c == chrom_b])
         bp_b = (chrom_b, pos_b)
         return (bp_a, bp_b), len(reads)
 
     @staticmethod
-    def _consensus_pos(positions):
-        """Median position (robust); fallback to mode if only one value."""
+    def _consensus_pos(positions, window_bp=50, trim_frac=0.15):
+        """Best estimate of breakpoint from a list of supporting positions.
+        - Use exact mode if one position has >= 20% of evidence (true junction often has many reads at same base).
+        - Else use densest window: find the window of size window_bp with the most positions, return median inside it (robust to outliers).
+        - Fallback: trimmed median (drop trim_frac from each tail) then median.
+        """
         if not positions:
             return 0
         if len(positions) == 1:
             return positions[0]
-        return int(statistics.median(positions))
+        cnt = Counter(positions)
+        mode_pos, mode_count = cnt.most_common(1)[0]
+        if mode_count >= max(2, len(positions) * 0.20):
+            return mode_pos
+        sorted_pos = sorted(positions)
+        n = len(sorted_pos)
+        # Densest window: slide a window of size window_bp, keep the one with max count
+        best_start = 0
+        best_count = 0
+        left = 0
+        for right in range(n):
+            while sorted_pos[right] - sorted_pos[left] > window_bp:
+                left += 1
+            if right - left + 1 > best_count:
+                best_count = right - left + 1
+                best_start = left
+        if best_count >= max(2, n * 0.15):
+            cluster = sorted_pos[best_start : best_start + best_count]
+            return int(statistics.median(cluster))
+        # Trimmed median: drop trim_frac from each tail to reduce outlier effect
+        drop = max(0, int(n * trim_frac))
+        if drop > 0 and n > 2 * drop:
+            trimmed = sorted_pos[drop : n - drop]
+            if trimmed:
+                return int(statistics.median(trimmed))
+        return int(statistics.median(sorted_pos))
 
     def _get_mate_end(self, read, cache, bam=None):
         """Mate's last ref base (0-based). Uses mate from BAM when available; else estimate."""
