@@ -1,0 +1,3 @@
+# SRR25536660 expected fusion (CD74-ROS1); positions 1-based
+# sample	gene_a	gene_b	chrom_a	pos_a	chrom_b	pos_b
+SRR25536660	CD74	ROS1	chr6	117647499	chr5	149783394

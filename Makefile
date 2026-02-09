@@ -44,6 +44,10 @@ Test/H3122.bam:
 check-H3122: Test/H3122.bam
 	python scripts/check_breakpoints.py $(OUTDIR)/H3122_fusions.tsv --truth scripts/truth_H3122.txt --tolerance 100
 
+# Run SRR25536660 and check CD74-ROS1 breakpoints vs truth (chr6:117647499, chr5:149783394); use tolerance 2 for 1–2 bp accuracy
+check-SRR25536660: Test/SRR25536660.bam
+	python scripts/check_breakpoints.py $(OUTDIR)/SRR25536660_fusions.tsv --truth scripts/truth_SRR25536660.txt --tolerance 2
+
 # Convenience targets by sample name (run e.g. make SRR948904)
 SRR948904:       Test/SRR948904.bam
 SRR25536655:     Test/SRR25536655.bam
