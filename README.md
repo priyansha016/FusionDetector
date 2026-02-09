@@ -4,7 +4,6 @@
 
 ## Why this project
 
-Three existing tools (Factera, GeneFuse, JuLI) were tried on two sample sets: VA/F1cdx BAMs (bwa-sampe) and literature benchmarking data. **All fail on different BAM types:** JuLI and GeneFuse work on external samples but find no fusions in VA BAMs; Factera fails on most external samples but works ~50% on VA BAMs. Their logic was studied as **reference only**; this project implements a **different, BAM-type–aware** pipeline that:
 
 1. **Detects BAM type** (e.g. high SA-tag/split-read density vs legacy discordant-only).
 2. **Finds fusions** from BAM using a strategy that fits that type.
