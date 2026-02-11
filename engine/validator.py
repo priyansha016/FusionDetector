@@ -4,7 +4,7 @@ class FusionValidator:
     def __init__(self, fasta_path):
         self.fasta_path = fasta_path
         self.fasta = None
-        self.blacklist_prefixes = ("NBPF", "PCDH", "LOC", "HLA", "OR", "MUC", "KRT", "GOLG", "LINC")
+        self.blacklist_prefixes = ("NBPF", "PCDH", "LOC", "HLA", "OR", "MUC", "KRT", "GOLG", "LINC", "RPS")
 
     def _ensure_fasta(self):
         """Opens the FASTA handle locally in the worker process."""
@@ -31,12 +31,16 @@ class FusionValidator:
         # 1. Same Gene or Paralog family
         if g1 == g2 or g1[:4] == g2[:4]:
             return True
+        # Same gene family (ZNF, GYP) — often aligner confusion
+        if len(g1) >= 3 and len(g2) >= 3 and g1[:3] == g2[:3]:
+            if g1.startswith("ZNF") or g1.startswith("GYP"):
+                return True
 
-        # 2. Intra-chromosomal Neighbor Filter (200KB: likely read-through only)
+        # 2. Intra-chromosomal Neighbor Filter (500KB: likely read-through)
         if chrom_a == chrom_b:
             try:
                 dist = abs(int(pos_a) - int(pos_b))
-                if dist < 200000:  # 200KB: likely neighbor/read-through
+                if dist < 500000:  # 500KB: likely neighbor/read-through (e.g. GYPA-GYPE)
                     return True
                 # Do NOT require SA tags for same-chromosome fusions (e.g. EML4-ALK on chr2);
                 # legacy BAMs may have low SA fraction but true fusions.
@@ -62,9 +66,28 @@ class FusionValidator:
         
         # 5. Require minimum SA tag fraction for inter-chromosomal fusions (if available)
         if chrom_a != chrom_b and sa_fraction is not None and sa_fraction < 0.15:
-            # Inter-chromosomal fusions with <15% SA tags AND low support are suspicious
             if support is not None and support < 28:
                 return True
+        if chrom_a != chrom_b and support is not None and 20 <= support <= 21 and sa_fraction is not None and sa_fraction < 0.25:
+            return True  # Very low support + low SA → filter
+        
+        # 6. Minimum absolute SA read count for inter-chromosomal (reduces discordant-only artifacts)
+        if chrom_a != chrom_b and support is not None and sa_fraction is not None:
+            estimated_sa_count = support * sa_fraction
+            if support <= 30 and estimated_sa_count < 3:
+                return True
+            if 30 < support <= 45 and estimated_sa_count < 4:
+                return True  # Keep 24-read fusions with ≥3 SA (e.g. CD74-ROS1)
+        
+        # 7. Same-chromosome with very low support and no SA evidence
+        if chrom_a == chrom_b and support is not None and 20 <= support <= 23:
+            if sa_fraction is not None and sa_fraction < 0.15:
+                return True  # Discordant-only same-chromosome at 20–23 reads
+        
+        # 8. Moderate support but very low SA fraction (inter-chromosomal)
+        if chrom_a != chrom_b and support is not None and 24 <= support <= 32:
+            if sa_fraction is not None and sa_fraction < 0.1:
+                return True  # Require at least ~10% SA when support is moderate
                 
         return False
 

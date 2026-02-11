@@ -89,7 +89,7 @@ Results are written to `<outdir>/<sample_name>_fusions.tsv` with the following c
 2. **Unified Evidence Integration**: Combines discordant pairs and split-read evidence in a single pipeline, rather than requiring separate tools for different evidence types.
 
 3. **Advanced Artifact Filtering**: Implements sophisticated false-positive reduction including:
-   - Per-sample hotspot detection (not global blacklists)
+   - Global filters only (no sample-specific rules; same thresholds for all samples)
    - Breakpoint clustering to identify mapping artifacts
    - Adaptive thresholds based on evidence quality (SA tag fraction)
 

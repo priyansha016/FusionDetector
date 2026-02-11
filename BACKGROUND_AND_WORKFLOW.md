@@ -38,7 +38,7 @@ The pipeline has four main stages:
    Apply **false-positive filters** (e.g. same-gene/paralog, intra-chromosomal neighbors &lt;200 kb, blacklisted gene families, adaptive support and SA-fraction thresholds). Only candidates that pass are kept.
 
 4. **Post-processing and reporting**  
-   Deduplicate gene aliases, filter **breakpoint clusters** (many fusions sharing one breakpoint region = likely artifact), filter **hotspots** (genes appearing in many fusions in one sample), then write the final list to a TSV file.
+   Deduplicate gene aliases, filter **breakpoint clusters** (many fusions sharing one breakpoint region = likely artifact), filter duplicate breakpoints, filter **low-confidence** calls (global support/SA thresholds), then write the final list to a TSV file. All filters use global thresholds (no sample-specific logic).
 
 So: **BAM + RefFlat + optional FASTA** → **Discovery** → **Assembly** → **Validation** → **Post-processing** → **TSV output**.
 
@@ -50,7 +50,7 @@ So: **BAM + RefFlat + optional FASTA** → **Discovery** → **Assembly** → **
 |--------|----------------|----------------------|
 | **BAM type** | Single pipeline for both modern (SA-rich) and legacy (discordant-heavy) BAMs. | Many tools assume one BAM/aligner type and fail on others. |
 | **Evidence** | Combines discordant pairs and split-reads (SA) in one flow; no need to run separate tools. | Some tools are mainly discordant-based or mainly split-read-based. |
-| **False positives** | Per-sample hotspot detection, breakpoint-cluster filtering, adaptive support/SA thresholds, no global “hotspot list” that might drop true fusions. | Often rely on fixed thresholds or global blacklists. |
+| **False positives** | Per-sample Global filters only: breakpoint-cluster, duplicate-breakpoint, adaptive support/SA in validator, low-confidence. No sample-specific rules. | Often rely on fixed thresholds or global blacklists. |
 | **Breakpoints** | When FASTA is provided and SA tags exist, refines breakpoints using reference and soft-clips. | Not all tools do reference-based refinement. |
 | **Input** | BAM + RefFlat + FASTA (optional but recommended). Optional target gene list. | Some tools need FASTQ; some need BAM + different annotation formats. |
 | **Scalability** | Multiprocessing for many BAMs and for per-sample gene-pair parallelism. | Varies by tool. |
@@ -63,7 +63,7 @@ So: **BAM + RefFlat + optional FASTA** → **Discovery** → **Assembly** → **
 
 | File | Role |
 |------|------|
-| **`main.py`** | CLI entry point. Parses arguments (`--input`, `--ref`, `--fasta`, `--outdir`, `--cores`, `--target`, etc.), resolves BAM list (single file or directory), loads target genes if provided. For each sample, calls `process_sample()`. Handles parallelism: single BAM → one process with internal pool for gene pairs; multiple BAMs → one pool of processes (one per BAM). Builds per-gene-pair work items (with serialized reads), runs assembly/validation in workers, then runs post-processing (dedup, breakpoint-cluster filter, duplicate-breakpoint filter, hotspot filter) and reporting. |
+| **`main.py`** | CLI entry point. Parses arguments (`--input`, `--ref`, `--fasta`, `--outdir`, `--cores`, `--target`, etc.), resolves BAM list (single file or directory), loads target genes if provided. For each sample, calls `process_sample()`. Handles parallelism: single BAM → one process with internal pool for gene pairs; multiple BAMs → one pool of processes (one per BAM). Builds per-gene-pair work items (with serialized reads), runs assembly/validation in workers, then runs post-processing (dedup, breakpoint-cluster filter, duplicate-breakpoint filter, low-confidence filter) and reporting. |
 
 ### Engine (core logic)
 
@@ -140,7 +140,7 @@ STEP 2 – PER-SAMPLE (process_sample in main.py)
       • Deduplicate gene aliases (e.g. MYCN/MYCNOS same breakpoint).
       • Filter breakpoint clusters (≥3 fusions in same small region → keep best).
       • Filter duplicate breakpoints (same chr:pos in multiple fusions → keep best).
-      • Filter hotspots (per-sample: genes in &gt;3 fusions, drop low-support hotspot–hotspot pairs with exceptions).
+      • Filter low-confidence (global: support 20–21 and low SA fraction, unless target gene).
 
   2f. Report (utils/reporter.py)
       • Write final list to <outdir>/<sample_name>_fusions.tsv (1-based positions).

@@ -4,3 +4,8 @@ __pycache__/
 Test/
 hg19.p13.plusMT.no_alt_analysis_set.bwa_index.tar.gz
 hg19.p13.plusMT.no_alt_analysis_set/
+
+# Local evaluation scripts and truth (optional to track)
+scripts/evaluate_fp_tp.py
+scripts/expected_fusions_all_samples.txt
+scripts/run_and_evaluate.sh

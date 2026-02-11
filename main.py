@@ -3,6 +3,7 @@ import os
 import glob
 import multiprocessing
 import time
+from collections import Counter
 import pysam
 from utils.genome_index import GenomeIndex
 from engine.discoverer import FusionDiscoverer, ReadLike, _read_to_dict
@@ -52,6 +53,44 @@ def _normalize_gene_name(gene):
     return aliases.get(g, g)
 
 
+def _filter_sink_breakpoints(results):
+    """
+    Sink filter: a breakpoint region that appears in many different fusions is likely
+    a mapping artifact (e.g. chr2:33141xxx "fusing" with many genes). Drop any fusion
+    that has either breakpoint in such a sink. Preserves real fusions (e.g. CD74-ROS1)
+    which have unique breakpoints.
+    """
+    if not results or len(results) < 2:
+        return results
+    BIN_KB = 10  # 10kb bin (same order as cluster window)
+    SINK_THRESHOLD = 3  # bin in >3 fusions = sink
+    bin_counts = Counter()
+    for r in results:
+        chrom_a, pos_a = r.get("chrom_a", ""), r.get("pos_a", 0)
+        chrom_b, pos_b = r.get("chrom_b", ""), r.get("pos_b", 0)
+        bin_a = (chrom_a, pos_a // (BIN_KB * 1000)) if chrom_a and pos_a is not None else None
+        bin_b = (chrom_b, pos_b // (BIN_KB * 1000)) if chrom_b and pos_b is not None else None
+        if bin_a:
+            bin_counts[bin_a] += 1
+        if bin_b and bin_b != bin_a:
+            bin_counts[bin_b] += 1
+    sink_bins = {b for b, c in bin_counts.items() if c > SINK_THRESHOLD}
+    if not sink_bins:
+        return results
+    filtered = []
+    for r in results:
+        chrom_a, pos_a = r.get("chrom_a", ""), r.get("pos_a", 0)
+        chrom_b, pos_b = r.get("chrom_b", ""), r.get("pos_b", 0)
+        bin_a = (chrom_a, pos_a // (BIN_KB * 1000)) if chrom_a and pos_a is not None else None
+        bin_b = (chrom_b, pos_b // (BIN_KB * 1000)) if chrom_b and pos_b is not None else None
+        if bin_a in sink_bins or bin_b in sink_bins:
+            continue
+        filtered.append(r)
+    if len(filtered) < len(results):
+        print(f"[*] Filtered {len(results) - len(filtered)} sink breakpoint fusions (bin in >{SINK_THRESHOLD} fusions)", flush=True)
+    return filtered
+
+
 def _filter_breakpoint_clusters(results):
     """
     Filter breakpoint clusters: when multiple fusions share the same breakpoint region
@@ -90,10 +129,10 @@ def _filter_breakpoint_clusters(results):
             # Create new cluster using bp_a as anchor
             bp_clusters[bp_a] = {idx}
     
-    # Filter clusters with >=3 fusions (likely artifacts)
+    # Filter clusters with >=2 fusions (tuned for 5–7 FP target)
     suspicious_clusters = {}
     for cluster_key, fusion_indices in bp_clusters.items():
-        if len(fusion_indices) >= 3:
+        if len(fusion_indices) >= 2:
             suspicious_clusters[cluster_key] = fusion_indices
     
     if not suspicious_clusters:
@@ -203,63 +242,75 @@ def _deduplicate_gene_aliases(results):
     return deduped
 
 
-def _filter_hotspots(results, user_targets):
+def _filter_low_confidence(results, user_targets):
     """
-    Filter fusions where both genes are hotspots in this sample's results.
-    Hotspots are computed per sample: a gene is a hotspot only if it appears
-    in >3 fusions in this sample. So SYPL1 is not a global hotspot—only in
-    samples where it shows up in many fusions. Preserves target fusions and
-    high-support calls.
+    Drop very low-confidence calls: support 20-21 with minimal SA evidence,
+    unless they involve a target gene. Keeps true fusions with 22+ support.
     """
     if not results:
         return results
-    
-    # Count gene appearances in this sample only (using normalized names)
+    user_targets = set(user_targets) if user_targets else set()
+    filtered = []
+    for r in results:
+        support = r.get("support", 0)
+        sa_frac = r.get("sa_fraction", 1.0)
+        g_a = _normalize_gene_name(r.get("gene_a", ""))
+        g_b = _normalize_gene_name(r.get("gene_b", ""))
+        is_target = g_a in user_targets or g_b in user_targets
+        if is_target:
+            filtered.append(r)
+            continue
+        if 20 <= support <= 21 and sa_frac < 0.2:
+            continue  # Very low confidence
+        filtered.append(r)
+    if len(filtered) < len(results):
+        print(f"[*] Filtered {len(results) - len(filtered)} low-confidence fusions (support 20-21, low SA)", flush=True)
+    return filtered
+
+
+# Global threshold: same for all samples (genes appearing this many times = repeating)
+REPEATING_GENE_THRESHOLD = 3
+
+
+def _filter_repeating_genes(results, user_targets):
+    """
+    Global filter: genes appearing >= REPEATING_GENE_THRESHOLD times (in either column)
+    are treated as repeating. Drop fusions where both genes are repeating, or one is
+    repeating with low support/SA. Same threshold for every sample.
+    """
+    if not results:
+        return results
+    # Count each gene in both columns (global rule: use both gene_a and gene_b)
     gene_counts = {}
     for r in results:
         g_a = _normalize_gene_name(r.get("gene_a", ""))
         g_b = _normalize_gene_name(r.get("gene_b", ""))
         gene_counts[g_a] = gene_counts.get(g_a, 0) + 1
         gene_counts[g_b] = gene_counts.get(g_b, 0) + 1
-    
-    # Per-sample hotspots: genes appearing in >=3 fusions in this sample only
-    HOTSPOT_THRESHOLD = 3
-    hotspots = {g for g, count in gene_counts.items() if count >= HOTSPOT_THRESHOLD}
-    
-    # Filter duplicate breakpoints (same chr:pos appearing in multiple fusions)
-    filtered = _filter_duplicate_breakpoints(results)
-    
-    if not hotspots:
-        return filtered
-    
-    # Filter: remove fusions where BOTH genes are hotspots (unless one is a target or high support)
+    repeating = {g for g, c in gene_counts.items() if c >= REPEATING_GENE_THRESHOLD}
+    if not repeating:
+        return results
     user_targets = set(user_targets) if user_targets else set()
-    final_filtered = []
-    for r in filtered:
+    filtered = []
+    for r in results:
         g_a = _normalize_gene_name(r.get("gene_a", ""))
         g_b = _normalize_gene_name(r.get("gene_b", ""))
-        is_hotspot_fusion = (g_a in hotspots and g_b in hotspots)
-        is_target_fusion = (g_a in user_targets or g_b in user_targets)
         support = r.get("support", 0)
-        
-        # Keep if: not a hotspot fusion, OR it involves a target gene, OR high support
-        if not is_hotspot_fusion or is_target_fusion or support >= 40:
-            final_filtered.append(r)
-        # Filter if ONE gene is a hotspot AND support is very low (< 25) AND low SA tags
-        elif (g_a in hotspots or g_b in hotspots):
-            sa_frac = r.get("sa_fraction", 1.0)  # Default to 1.0 if not present (conservative)
-            # Only filter if low support AND low SA tags (likely artifact)
-            if support < 25 and sa_frac < 0.2:
-                continue  # Filter out low-support, low-SA-tag fusions involving hotspots
-            else:
-                final_filtered.append(r)  # Keep if decent SA tags even with hotspot
-        else:
-            final_filtered.append(r)
-    
-    if len(final_filtered) < len(filtered):
-        print(f"[*] Filtered {len(filtered) - len(final_filtered)} hotspot fusions", flush=True)
-    
-    return final_filtered
+        sa_frac = r.get("sa_fraction", 1.0)
+        is_target = g_a in user_targets or g_b in user_targets
+        both_repeating = (g_a in repeating and g_b in repeating)
+        one_repeating = (g_a in repeating or g_b in repeating)
+        if is_target:
+            filtered.append(r)
+            continue
+        if both_repeating and support < 40:
+            continue
+        if one_repeating and support < 35 and sa_frac < 0.25:
+            continue
+        filtered.append(r)
+    if len(filtered) < len(results):
+        print(f"[*] Filtered {len(results) - len(filtered)} repeating-gene fusions (global threshold ≥{REPEATING_GENE_THRESHOLD})", flush=True)
+    return filtered
 
 
 def _process_one_gene_pair(bam_path, fasta_path, sample_name, gene_pair, reads_dicts, user_targets, min_support):
@@ -331,9 +382,11 @@ def _process_one_gene_pair(bam_path, fasta_path, sample_name, gene_pair, reads_d
             bam_handle.close()
 
 
-def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_workers=1, min_mapq=20, use_process_discovery=False):
+def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_workers=1, min_mapq=20, use_process_discovery=False, min_support=None):
+    if min_support is None:
+        min_support = MIN_SUPPORT
     sample_name = os.path.basename(bam_path).replace(".bam", "")
-    print(f"[*] Processing: {sample_name} (n_workers={n_workers}, discovery={'processes' if use_process_discovery else 'threads'})", flush=True)
+    print(f"[*] Processing: {sample_name} (n_workers={n_workers}, min_support={min_support}, discovery={'processes' if use_process_discovery else 'threads'})", flush=True)
 
     try:
         idx = GenomeIndex()
@@ -350,7 +403,7 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
             if not reads:
                 continue
             reads_dicts = [_serialize_read(r) for r in reads]
-            items.append((bam_path, fasta_path, sample_name, gene_pair, reads_dicts, tuple(user_targets) if user_targets else (), MIN_SUPPORT))
+            items.append((bam_path, fasta_path, sample_name, gene_pair, reads_dicts, tuple(user_targets) if user_targets else (), min_support))
 
         if not items:
             final_results = []
@@ -387,11 +440,13 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
                     if (i + 1) % max(1, total // 10) == 0 or i + 1 == total:
                         print(f"[*] Assembly progress: {i + 1}/{total} gene pairs", flush=True)
             
-            # Post-process: deduplicate gene aliases, filter breakpoint clusters, filter duplicates, then filter hotspots
+            # Post-process: global filters only (same thresholds for all samples)
             final_results = _deduplicate_gene_aliases(final_results)
+            final_results = _filter_sink_breakpoints(final_results)
             final_results = _filter_breakpoint_clusters(final_results)
             final_results = _filter_duplicate_breakpoints(final_results)
-            final_results = _filter_hotspots(final_results, user_targets)
+            final_results = _filter_low_confidence(final_results, user_targets)
+            final_results = _filter_repeating_genes(final_results, user_targets)
             print(f"[*] Assembly done in {time.perf_counter() - t0:.1f}s ({len(final_results)} fusions after filtering)", flush=True)
 
         out_file = os.path.join(output_dir, f"{sample_name}_fusions.tsv")
@@ -412,6 +467,8 @@ def main():
                         help="Cores: parallel BAMs + threads per BAM for discovery (default: min(BAM count, CPU count)). Single BAM uses this many threads.")
     parser.add_argument("--min-mapq", type=int, default=20, metavar="N",
                         help="Min mapping quality for discovery (default: 20). Use 10 for truth sets / low MAPQ at breakpoints.")
+    parser.add_argument("--min-support", type=int, default=MIN_SUPPORT, metavar="N",
+                        help=f"Minimum read support for a fusion to be reported (default: {MIN_SUPPORT}).")
     parser.add_argument("--target", help="Path to txt file with gene list (one per line)")
     args = parser.parse_args()
 
@@ -442,10 +499,11 @@ def main():
     print(f"[*] Parallel BAMs: {n_processes}, discovery: {'processes' if use_process_discovery else 'threads'} (--cores={n_workers}).")
 
     min_mapq = getattr(args, "min_mapq", 20)
+    min_support = getattr(args, "min_support", MIN_SUPPORT)
     if n_processes == 1:
         # Single BAM: call directly to avoid nested pools (daemonic processes can't spawn children)
         # The per-gene-pair pool inside process_sample will still create N worker processes
-        result = process_sample(bam_files[0], args.ref, args.fasta, args.outdir, user_targets, n_workers, min_mapq, use_process_discovery)
+        result = process_sample(bam_files[0], args.ref, args.fasta, args.outdir, user_targets, n_workers, min_mapq, use_process_discovery, min_support)
         print(result)
     else:
         # Multiple BAMs: use Pool for parallel BAM processing
@@ -453,7 +511,7 @@ def main():
         with multiprocessing.Pool(n_processes) as pool:
             results = pool.starmap(
                 process_sample,
-                [(f, args.ref, args.fasta, args.outdir, user_targets, n_workers, min_mapq, use_process_discovery) for f in bam_files],
+                [(f, args.ref, args.fasta, args.outdir, user_targets, n_workers, min_mapq, use_process_discovery, min_support) for f in bam_files],
             )
         for res in results:
             print(res)
