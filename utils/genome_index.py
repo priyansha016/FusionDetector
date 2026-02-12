@@ -44,3 +44,60 @@ class GenomeIndex:
 
     def is_known_chrom(self, chrom):
         return _normalize_chrom(chrom) in self.trees
+
+
+def load_exon_boundaries(refflat_path):
+    """
+    Load exon boundaries from refFlat file for post-processing filter.
+    Returns: dict mapping chrom -> set of exon boundary positions
+    """
+    exon_boundaries = collections.defaultdict(set)
+    opener = gzip.open(refflat_path, 'rt') if refflat_path.endswith('.gz') else open(refflat_path, 'r')
+    count = 0
+    with opener as f:
+        for line in f:
+            if line.startswith('#'): continue
+            parts = line.strip().split('\t')
+            if len(parts) < 11: continue  # Need at least 11 columns for exon info
+            
+            chrom = _normalize_chrom(parts[2])
+            
+            # Parse exon boundaries (columns 9 and 10: exonStarts, exonEnds)
+            try:
+                exon_starts = [int(x) for x in parts[9].rstrip(',').split(',') if x]
+                exon_ends = [int(x) for x in parts[10].rstrip(',').split(',') if x]
+                
+                # Add all exon boundaries (both starts and ends)
+                for pos in exon_starts + exon_ends:
+                    exon_boundaries[chrom].add(pos)
+                    count += 1
+            except (ValueError, IndexError):
+                # Skip if exon parsing fails
+                pass
+    
+    print(f"[*] Loaded {count} exon boundaries for post-processing filter.")
+    return exon_boundaries
+
+
+def get_nearest_exon_boundary(exon_boundaries, chrom, pos, window=20):
+    """
+    Find the distance to the nearest exon boundary.
+    Returns: (distance, is_near_boundary) where is_near_boundary is True if within window bp
+    """
+    clean_chrom = _normalize_chrom(chrom)
+    if clean_chrom not in exon_boundaries:
+        return (None, False)
+    
+    boundaries = exon_boundaries[clean_chrom]
+    if not boundaries:
+        return (None, False)
+    
+    # Find nearest boundary
+    min_dist = None
+    for boundary_pos in boundaries:
+        dist = abs(pos - boundary_pos)
+        if min_dist is None or dist < min_dist:
+            min_dist = dist
+    
+    is_near = min_dist is not None and min_dist <= window
+    return (min_dist, is_near)
