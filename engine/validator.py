@@ -4,7 +4,9 @@ class FusionValidator:
     def __init__(self, fasta_path):
         self.fasta_path = fasta_path
         self.fasta = None
-        self.blacklist_prefixes = ("NBPF", "PCDH", "LOC", "HLA", "OR", "MUC", "KRT", "GOLG", "LINC", "RPS")
+        self.blacklist_prefixes = ("NBPF", "PCDH", "LOC", "HLA", "OR", "MUC", "KRT", "GOLG", "LINC", "RPS", "SNHG")
+        # RNA processing genes that often cause mapping artifacts (but allow high-quality exceptions)
+        self.rna_processing_genes = {"DROSHA", "DICER1"}
 
     def _ensure_fasta(self):
         """Opens the FASTA handle locally in the worker process."""
@@ -66,14 +68,35 @@ class FusionValidator:
                 pass
         
         # 3. Blacklist Check
-        # Filter ALL fusions involving blacklisted genes (LINC, LOC, etc.) regardless of support
-        # These are typically repetitive elements or non-coding RNAs that cause mapping artifacts
-        # No exceptions - if any gene is blacklisted, filter the fusion
+        # Filter fusions involving blacklisted genes (LINC, LOC, SNHG, etc.)
+        # SNHG genes: Long non-coding RNAs rarely involved in true fusions, but allow high-quality exceptions
+        # Other prefixes: No exceptions (LOC, LINC, etc. are mapping artifacts)
         g1_blacklisted = any(g1.startswith(p) for p in self.blacklist_prefixes)
         g2_blacklisted = any(g2.startswith(p) for p in self.blacklist_prefixes)
         if g1_blacklisted or g2_blacklisted:
             matched_prefix = next((p for p in self.blacklist_prefixes if g1.startswith(p) or g2.startswith(p)), "unknown")
-            return (True, f"FILTERED: Blacklisted prefix ({matched_prefix}) - these genes cause mapping artifacts")
+            # SNHG genes: Allow exceptions for high-quality fusions (support >= 35 or SA >= 0.30)
+            # This preserves any rare true fusions while filtering mapping artifacts
+            if matched_prefix == "SNHG":
+                if support is not None and (support >= 35 or (sa_fraction is not None and sa_fraction >= 0.30)):
+                    # High-quality SNHG fusion - allow it
+                    pass
+                else:
+                    return (True, f"FILTERED: Blacklisted prefix ({matched_prefix}) - low quality (support={support}, SA={sa_fraction:.2f if sa_fraction else 'N/A'})")
+            else:
+                # Other blacklisted prefixes: no exceptions
+                return (True, f"FILTERED: Blacklisted prefix ({matched_prefix}) - these genes cause mapping artifacts")
+        
+        # 3b. RNA Processing Gene Filter
+        # DROSHA, DICER1 often cause mapping artifacts, but allow high-quality exceptions
+        if g1 in self.rna_processing_genes or g2 in self.rna_processing_genes:
+            matched_gene = g1 if g1 in self.rna_processing_genes else g2
+            # Allow exceptions for high-quality fusions (support >= 35 or SA >= 0.30)
+            if support is not None and (support >= 35 or (sa_fraction is not None and sa_fraction >= 0.30)):
+                # High-quality RNA processing gene fusion - allow it
+                pass
+            else:
+                return (True, f"FILTERED: RNA processing gene ({matched_gene}) - low quality (support={support}, SA={sa_fraction:.2f if sa_fraction else 'N/A'})")
         
         # 4. Adaptive support threshold: stricter when combined with suspicious signals
         # Base threshold: 20 reads (true fusions can have 20-25 reads)
@@ -90,11 +113,15 @@ class FusionValidator:
         
         # 5. Stricter SA requirements for inter-chromosomal fusions (most FPs are inter-chr)
         # Most inter-chromosomal FPs have support 22-24, so we need stricter thresholds
+        # Enhanced: Support 22-23 now requires SA >= 0.25 (stricter)
         if chrom_a != chrom_b:
             if sa_fraction is not None:
-                # Support 22-24: require SA >= 0.20 (stricter than before)
-                if support is not None and 22 <= support <= 24 and sa_fraction < 0.20:
-                    return (True, f"FILTERED: Inter-chromosomal, support={support} <= 24 and SA fraction={sa_fraction:.2f} < 0.20")
+                # Support 22-23: require SA >= 0.25 (stricter - these are very common FPs)
+                if support is not None and 22 <= support <= 23 and sa_fraction < 0.25:
+                    return (True, f"FILTERED: Inter-chromosomal, support={support} <= 23 and SA fraction={sa_fraction:.2f} < 0.25")
+                # Support 24: require SA >= 0.20
+                if support is not None and support == 24 and sa_fraction < 0.20:
+                    return (True, f"FILTERED: Inter-chromosomal, support={support} == 24 and SA fraction={sa_fraction:.2f} < 0.20")
                 # Support 25-28: require SA >= 0.15
                 if support is not None and 25 <= support <= 28 and sa_fraction < 0.15:
                     return (True, f"FILTERED: Inter-chromosomal, support={support} <= 28 and SA fraction={sa_fraction:.2f} < 0.15")

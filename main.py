@@ -165,6 +165,10 @@ def _filter_sink_breakpoints(results, user_targets=None, traced_pairs=None, trac
     SEVERE_SINK_THRESHOLD = 5  # If a bin appears in >= 5 fusions, it's a severe sink
     severe_sink_bins = {b for b, c in bin_counts.items() if c >= SEVERE_SINK_THRESHOLD}
     
+    # Chromosome-specific sink detection: chr1, chr2, chr3 are large chromosomes prone to mapping artifacts
+    # If a breakpoint is on these chromosomes AND in a sink bin, apply stricter filtering
+    LARGE_CHROMOSOMES = {"chr1", "chr2", "chr3"}
+    
     filtered = []
     filtered_names = []
     for r, bin_a, bin_b, fusion_name, g_a_norm, g_b_norm, support, sa_frac, is_target in fusion_data:
@@ -212,6 +216,27 @@ def _filter_sink_breakpoints(results, user_targets=None, traced_pairs=None, trac
             sink_bin = bin_a if bp_a_in_sink else bin_b
             sink_count = bin_counts[sink_bin]
             
+            # Chromosome-specific stricter filtering: chr1/chr2/chr3 are prone to mapping artifacts
+            # If breakpoint is on large chromosome AND in sink, require higher support/SA
+            is_large_chr_sink = sink_bin[0] in LARGE_CHROMOSOMES
+            
+            if is_large_chr_sink:
+                # Large chromosome sink: require support >= 30 OR SA >= 0.30 (stricter than regular sinks)
+                if support >= 30 or sa_frac >= 0.30:
+                    if is_traced and trace_logger:
+                        quality_reason = f"support={support} >= 30" if support >= 30 else f"SA fraction={sa_frac:.2f} >= 0.30"
+                        sink_info = f" (breakpoint on {sink_bin[0]} in sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB but {quality_reason})"
+                        trace_logger.log_filter_result(fusion_name, "sink_breakpoints", True, f"Large chromosome sink exempt{sink_info}")
+                    filtered.append(r)
+                    continue
+                else:
+                    # Filter low-quality fusions in large chromosome sinks
+                    filtered_names.append(fusion_name)
+                    if is_traced and trace_logger:
+                        trace_logger.log_filter_result(fusion_name, "sink_breakpoints", False, f"Breakpoint on {sink_bin[0]} in sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB (appears in {sink_count} fusions, support={support} < 30 and SA={sa_frac:.2f} < 0.30)")
+                    continue
+            
+            # Regular sink (not on large chromosome): standard exemptions
             # High support exemption (for moderate sinks with 3-4 fusions)
             # Lowered threshold to 25 to catch ROS1-SLC34A2 (support 42) and similar high-quality fusions
             if support >= 25:
