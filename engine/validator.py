@@ -39,15 +39,26 @@ class FusionValidator:
             if g1.startswith("ZNF") or g1.startswith("GYP"):
                 return (True, f"FILTERED: Same gene family ({g1[:3]})")
 
-        # 2. Intra-chromosomal Neighbor Filter (1MB: likely read-through or local mapping noise)
-        # Increased from 500KB to 1MB to catch ALK cluster artifacts (genes within 1MB window)
+        # 2. Intra-chromosomal Neighbor Filter (tiered filtering by distance)
+        # Very close breakpoints (<100KB) are almost always artifacts, even with high support
+        # Moderate distance (100KB-1MB) might be real inversions if high quality
         if chrom_a == chrom_b:
             try:
                 dist = abs(int(pos_a) - int(pos_b))
-                if dist < 1_000_000:  # 1MB: likely neighbor/read-through or local mapping noise
+                
+                # Tier 1: Very close (<100KB) - filter almost all, very strict exceptions
+                if dist < 100_000:  # 100KB
+                    # Exception: Extremely high support (>100) AND high SA fraction (>0.5) might be real
+                    # But most <100KB fusions are read-through transcripts or mapping artifacts
+                    if support is None or support <= 100 or sa_fraction is None or sa_fraction <= 0.5:
+                        return (True, f"FILTERED: Intra-chromosomal distance {dist:,}bp < 100KB (likely read-through or mapping artifact)")
+                
+                # Tier 2: Moderate distance (100KB-1MB) - filter unless high quality
+                elif dist < 1_000_000:  # 1MB
                     # Exception: High support (>50) AND high SA fraction (>0.3) might be real inversion
                     if support is None or support <= 50 or sa_fraction is None or sa_fraction <= 0.3:
                         return (True, f"FILTERED: Intra-chromosomal distance {dist:,}bp < 1MB (likely mapping artifact)")
+                
                 # Do NOT require SA tags for same-chromosome fusions (e.g. EML4-ALK on chr2);
                 # legacy BAMs may have low SA fraction but true fusions.
                 # Same-chromosome fusions >1MB apart are handled by other filters (support thresholds, etc.)
@@ -66,6 +77,7 @@ class FusionValidator:
         
         # 4. Adaptive support threshold: stricter when combined with suspicious signals
         # Base threshold: 20 reads (true fusions can have 20-25 reads)
+        # Most FPs (61%) have support < 25, so we filter more aggressively
         if support is not None:
             if support < 20:  # Absolute minimum
                 return (True, f"FILTERED: Support={support} < 20 (absolute minimum)")
@@ -76,25 +88,35 @@ class FusionValidator:
             if support < 22 and chrom_a != chrom_b:
                 return (True, f"FILTERED: Support={support} < 22 (inter-chromosomal)")
         
-        # 5. Require minimum SA tag fraction for inter-chromosomal fusions (if available)
-        # Stricter for low support cases
-        if chrom_a != chrom_b and sa_fraction is not None and sa_fraction < 0.10:
-            if support is not None and support < 26:
-                return (True, f"FILTERED: Inter-chromosomal, support={support} < 26 and SA fraction={sa_fraction:.2f} < 0.10")
-        # Very low support with minimal SA evidence
-        if chrom_a != chrom_b and support is not None and 20 <= support <= 22 and sa_fraction is not None and sa_fraction < 0.18:
-            return (True, f"FILTERED: Inter-chromosomal, support={support} <= 22 and SA fraction={sa_fraction:.2f} < 0.18")
+        # 5. Stricter SA requirements for inter-chromosomal fusions (most FPs are inter-chr)
+        # Most inter-chromosomal FPs have support 22-24, so we need stricter thresholds
+        if chrom_a != chrom_b:
+            if sa_fraction is not None:
+                # Support 22-24: require SA >= 0.20 (stricter than before)
+                if support is not None and 22 <= support <= 24 and sa_fraction < 0.20:
+                    return (True, f"FILTERED: Inter-chromosomal, support={support} <= 24 and SA fraction={sa_fraction:.2f} < 0.20")
+                # Support 25-28: require SA >= 0.15
+                if support is not None and 25 <= support <= 28 and sa_fraction < 0.15:
+                    return (True, f"FILTERED: Inter-chromosomal, support={support} <= 28 and SA fraction={sa_fraction:.2f} < 0.15")
+                # Support < 26: require SA >= 0.10 (catch low SA cases)
+                if support is not None and support < 26 and sa_fraction < 0.10:
+                    return (True, f"FILTERED: Inter-chromosomal, support={support} < 26 and SA fraction={sa_fraction:.2f} < 0.10")
         
         # 6. Minimum absolute SA read count for inter-chromosomal (reduces discordant-only artifacts)
         # Re-enabled with stricter thresholds
+        # Exception: High support (>= 35) fusions are preserved (e.g., ROS1-SLC34A2 with support 42)
         if chrom_a != chrom_b and support is not None and sa_fraction is not None:
-            estimated_sa_count = support * sa_fraction
-            # Filter if support <= 28 and SA count < 2
-            if support <= 28 and estimated_sa_count < 2:
-                return (True, f"FILTERED: Inter-chromosomal, support={support} <= 28 and estimated SA count={estimated_sa_count:.1f} < 2")
-            # Filter if support <= 35 and SA count < 3
-            if 28 < support <= 35 and estimated_sa_count < 3:
-                return (True, f"FILTERED: Inter-chromosomal, support={support} <= 35 and estimated SA count={estimated_sa_count:.1f} < 3")
+            # High support fusions are preserved regardless of SA count
+            if support >= 35:
+                pass  # Skip SA count check for high-support fusions
+            else:
+                estimated_sa_count = support * sa_fraction
+                # Filter if support <= 28 and SA count < 2
+                if support <= 28 and estimated_sa_count < 2:
+                    return (True, f"FILTERED: Inter-chromosomal, support={support} <= 28 and estimated SA count={estimated_sa_count:.1f} < 2")
+                # Filter if support <= 35 and SA count < 3
+                if 28 < support <= 35 and estimated_sa_count < 3:
+                    return (True, f"FILTERED: Inter-chromosomal, support={support} <= 35 and estimated SA count={estimated_sa_count:.1f} < 3")
         
         # 7. Same-chromosome with very low support and no SA evidence
         if chrom_a == chrom_b and support is not None and 20 <= support <= 24:

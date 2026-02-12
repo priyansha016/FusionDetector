@@ -12,6 +12,24 @@ class FusionAssembler:
     def __init__(self, bam_path=None, fasta_path=None):
         self.bam_path = bam_path
         self.fasta_path = fasta_path
+        self._fasta_handle = None  # Cache FASTA handle to avoid repeated open/close
+    
+    def _get_fasta(self):
+        """Get cached FASTA handle, opening it if needed."""
+        if self._fasta_handle is None and self.fasta_path:
+            try:
+                self._fasta_handle = pysam.FastaFile(self.fasta_path)
+            except Exception:
+                return None
+        return self._fasta_handle
+    
+    def __del__(self):
+        """Clean up FASTA handle on deletion."""
+        if self._fasta_handle is not None:
+            try:
+                self._fasta_handle.close()
+            except Exception:
+                pass
 
     def find_breakpoint(self, reads, bam=None):
         """Pass open bam handle to reuse (one open per sample); otherwise opens/closes per call."""
@@ -195,9 +213,8 @@ class FusionAssembler:
 
     def _refine_with_clips(self, reads, chrom_a, chrom_b, bp_a, bp_b, window=150, min_clip_len=15):
         """Refine breakpoints by aligning soft-clipped sequences to the reference. Returns (bp_a, bp_b) refined."""
-        try:
-            fasta = pysam.FastaFile(self.fasta_path)
-        except Exception:
+        fasta = self._get_fasta()
+        if fasta is None:
             return bp_a, bp_b
         pos_a, pos_b = bp_a[1], bp_b[1]
         # Normalize chrom for FASTA (some have chr, some don't)
@@ -213,7 +230,6 @@ class FusionAssembler:
         chrom_a_ref = ref_chrom(chrom_a)
         chrom_b_ref = ref_chrom(chrom_b)
         if chrom_a_ref not in fasta.references or chrom_b_ref not in fasta.references:
-            fasta.close()
             return bp_a, bp_b
         clips_for_a = []  # (approx_pos, sequence) for clips that map to chrom_a
         clips_for_b = []  # (approx_pos, sequence) for clips that map to chrom_b
@@ -259,16 +275,13 @@ class FusionAssembler:
                 top_b = [p for p, s in scored if s >= 0.85 * best_score_b]
                 if top_b:
                     refined_b = max(top_b)
-        fasta.close()
+        # Don't close fasta - it's cached for reuse
         return (chrom_a, refined_a), (chrom_b, refined_b)
 
     def _bp_correction_factera(self, reads, chrom_a, pos_a, chrom_b, pos_b, window=200, min_clip=10):
         """Factera-style: compare read sequence to reference at the other breakpoint; if clip matches ref at a different offset, use that position (breakpoints only)."""
-        if not self.fasta_path:
-            return (chrom_a, pos_a), (chrom_b, pos_b)
-        try:
-            fasta = pysam.FastaFile(self.fasta_path)
-        except Exception:
+        fasta = self._get_fasta()
+        if fasta is None:
             return (chrom_a, pos_a), (chrom_b, pos_b)
         def ref_chrom(c):
             c = str(c)
@@ -281,7 +294,6 @@ class FusionAssembler:
             return c
         ca, cb = ref_chrom(chrom_a), ref_chrom(chrom_b)
         if ca not in fasta.references or cb not in fasta.references:
-            fasta.close()
             return (chrom_a, pos_a), (chrom_b, pos_b)
         # Collect clips that map to each chrom (same as refinement)
         clips_b, clips_a = [], []
@@ -326,7 +338,7 @@ class FusionAssembler:
             return best_pos_val if best_score >= 5 else center
         new_a = best_pos(ca, pos_a, clips_a, use_end=True)
         new_b = best_pos(cb, pos_b, clips_b, use_end=False)
-        fasta.close()
+        # Don't close fasta - it's cached for reuse
         return (chrom_a, new_a), (chrom_b, new_b)
 
     def _align_clips_to_ref_scored(self, fasta, chrom, center_pos, clips, window, use_end=False, min_identity=0.5):
