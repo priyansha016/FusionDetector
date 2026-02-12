@@ -198,10 +198,10 @@ def _filter_sink_breakpoints(results, user_targets=None, traced_pairs=None, trac
             
             # In severe sinks, keep only very high-quality fusions:
             # - Very high support (>= 80) alone, OR
-            # - High support (>= 50) AND high SA fraction (>= 0.30) together
-            # This filters more mapping artifacts like chr2:33141xxx while preserving true very high-quality fusions
-            # Note: Default min_support is 20, so 50-80 is 2.5-4x the minimum, stricter for severe sinks
-            if support >= 80 or (support >= 50 and sa_frac >= 0.30):
+            # - Moderate-high support (>= 40) AND high SA fraction (>= 0.30) together
+            # This filters mapping artifacts like chr2:33141xxx while preserving true fusions like ROS1-SLC34A2 (support 42, SA 0.30)
+            # Note: Default min_support is 20, so 40-80 is 2-4x the minimum, balanced for severe sinks
+            if support >= 80 or (support >= 40 and sa_frac >= 0.30):
                 if is_traced and trace_logger:
                     if support >= 80:
                         quality_reason = f"very high support={support} >= 80"
@@ -214,7 +214,7 @@ def _filter_sink_breakpoints(results, user_targets=None, traced_pairs=None, trac
                 # Filter low-quality fusions in severe sinks
                 filtered_names.append(fusion_name)
                 if is_traced and trace_logger:
-                    trace_logger.log_filter_result(fusion_name, "sink_breakpoints", False, f"Breakpoint in severe sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB (appears in {sink_count} fusions, support={support} < 80 and (support < 50 or SA < 0.30))")
+                    trace_logger.log_filter_result(fusion_name, "sink_breakpoints", False, f"Breakpoint in severe sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB (appears in {sink_count} fusions, support={support} < 80 and (support < 40 or SA < 0.30))")
                 continue
         
         # 3. Regular sink: Apply exemptions for high-quality fusions
@@ -320,7 +320,7 @@ def _filter_breakpoint_clusters(results, user_targets=None, traced_pairs=None, t
             # Create new cluster using bp_a as anchor
             bp_clusters[bp_a] = {idx}
     
-    # Filter clusters with >=2 fusions (tuned for 5–7 FP target)
+    # Filter clusters with >=2 fusions (stricter: clusters are strong FP signals)
     suspicious_clusters = {k: v for k, v in bp_clusters.items() if len(v) >= 2}
     
     if not suspicious_clusters:
@@ -335,8 +335,10 @@ def _filter_breakpoint_clusters(results, user_targets=None, traced_pairs=None, t
     # Filter fusions in suspicious clusters, but keep high-quality ones
     # Strategy: Keep top N fusions per cluster (by support), or all fusions with support >= threshold
     # This preserves true fusions like ROS1-SLC34A2 even if they're in clusters
-    CLUSTER_KEEP_SUPPORT_THRESHOLD = 35  # Keep all fusions with support >= this, even in clusters
-    CLUSTER_KEEP_TOP_N = 2  # Keep top 2 fusions per cluster (in case multiple are real)
+    # Stricter: Require higher support OR both moderate support AND good SA evidence
+    CLUSTER_KEEP_SUPPORT_THRESHOLD = 50  # Keep all fusions with support >= this, even in clusters (stricter)
+    CLUSTER_KEEP_SA_THRESHOLD = 0.30  # Or keep if support >= 40 AND SA >= this
+    CLUSTER_KEEP_TOP_N = 1  # Keep only top 1 fusion per cluster (stricter - most clusters are artifacts)
     
     # First pass: find best fusions per cluster
     cluster_fusions = {}  # cluster_key -> list of (idx, support, sa_frac)
@@ -359,10 +361,18 @@ def _filter_breakpoint_clusters(results, user_targets=None, traced_pairs=None, t
         for idx, support, sa_frac in sorted_fusions:
             if support >= CLUSTER_KEEP_SUPPORT_THRESHOLD:
                 cluster_keep_indices.add(idx)
+            # Or keep if moderate support AND good SA evidence
+            elif support >= 40 and sa_frac >= CLUSTER_KEEP_SA_THRESHOLD:
+                cluster_keep_indices.add(idx)
         
-        # Also keep top N fusions per cluster (even if below threshold)
-        for idx, support, sa_frac in sorted_fusions[:CLUSTER_KEEP_TOP_N]:
-            cluster_keep_indices.add(idx)
+        # Also keep top N fusions per cluster (even if below threshold) - but only if they meet quality criteria
+        kept_top = 0
+        for idx, support, sa_frac in sorted_fusions:
+            if idx not in cluster_keep_indices and kept_top < CLUSTER_KEEP_TOP_N:
+                # Only keep top N if they have reasonable quality
+                if support >= 35 or (support >= 30 and sa_frac >= 0.25):
+                    cluster_keep_indices.add(idx)
+                    kept_top += 1
     
     # Second pass: build filtered list and track removals
     filtered = []
@@ -963,6 +973,43 @@ def _process_one_gene_pair(bam_path, fasta_path, ref_path, sample_name, gene_pai
         # Calculate SA tag fraction (split-read evidence)
         sa_count = sum(1 for r in reads if r.has_tag("SA"))
         sa_fraction = sa_count / len(reads) if reads else 0.0
+        
+        # JuLI-style filtering: For inter-chromosomal fusions, require BOTH discordant pairs AND split-reads
+        # This significantly reduces FPs while preserving true fusions like ROS1-SLC34A2
+        # (True fusions typically have both types of evidence)
+        chrom_a = bp_a[0]
+        chrom_b = bp_b[0]
+        is_inter_chr = chrom_a != chrom_b
+        
+        if is_inter_chr:
+            # Count discordant pairs (reads without SA tags)
+            discordant_count = len(reads) - sa_count
+            # JuLI-style filtering: Require BOTH discordant pairs AND split-reads for inter-chromosomal fusions
+            # But allow exceptions for high-support fusions (support >= 40) with good SA fraction (>= 0.15)
+            # This preserves true fusions like ROS1-SLC34A2 while filtering most FPs
+            MIN_DISCORDANT = 3
+            MIN_SPLIT_READS = 2
+            
+            # High-support exception: if support >= 40 AND SA >= 0.15, allow even if split-reads < 2
+            # (True fusions can have moderate SA fraction but high overall support)
+            high_support_exception = support >= 40 and sa_fraction >= 0.15
+            
+            if not high_support_exception:
+                # Standard requirement: BOTH discordant pairs >= 3 AND split-reads >= 2
+                if discordant_count < MIN_DISCORDANT or sa_count < MIN_SPLIT_READS:
+                    if is_traced and trace_logger:
+                        reason = f"Inter-chromosomal: requires BOTH discordant pairs >= {MIN_DISCORDANT} AND split-reads >= {MIN_SPLIT_READS}, but got discordant={discordant_count}, split-reads={sa_count}"
+                        trace_logger.log(f"[TRACE] {fusion_name}: ✗ DROPPED: {reason}")
+                    return None
+            else:
+                # High-support exception: still require discordant pairs >= 3
+                if discordant_count < MIN_DISCORDANT:
+                    if is_traced and trace_logger:
+                        reason = f"Inter-chromosomal: high-support exception (support={support} >= 40, SA={sa_fraction:.2f} >= 0.15) but discordant pairs {discordant_count} < {MIN_DISCORDANT}"
+                        trace_logger.log(f"[TRACE] {fusion_name}: ✗ DROPPED: {reason}")
+                    return None
+                if is_traced and trace_logger:
+                    trace_logger.log(f"[TRACE] {fusion_name}: Dual evidence - high-support exception (support={support} >= 40, SA={sa_fraction:.2f} >= 0.15)")
         
         if is_traced and trace_logger:
             trace_logger.log(f"[TRACE] {fusion_name}: Assembly - support={support}, {bp_a[0]}:{bp_a[1]} + {bp_b[0]}:{bp_b[1]}, sa_fraction={sa_fraction:.2f}")
