@@ -190,17 +190,23 @@ def _filter_sink_breakpoints(results, user_targets=None, traced_pairs=None, trac
         
         # 2. Severe sink: Filter most fusions, but keep high-quality ones
         # (e.g., chr2:33141xxx appearing in 6+ fusions is likely artifact, but keep best ones)
+        # Stricter: Require BOTH high support AND high SA fraction (not OR) for severe sinks
+        # OR very high support alone (>= 60) - catches true high-quality fusions without requiring SA
         if bp_a_in_severe_sink or bp_b_in_severe_sink:
             sink_bin = bin_a if bp_a_in_severe_sink else bin_b
             sink_count = bin_counts[sink_bin]
             
             # In severe sinks, keep only high-quality fusions:
-            # - High support (>= 35) OR
-            # - High SA fraction (>= 0.30)
-            # This preserves true fusions like ROS1-SLC34A2 (support 42) even in sink regions
-            if support >= 35 or sa_frac >= 0.30:
+            # - Very high support (>= 60) alone, OR
+            # - Moderate-high support (>= 40) AND high SA fraction (>= 0.30) together
+            # This filters mapping artifacts like chr2:33141xxx while preserving true high-quality fusions
+            # Note: Default min_support is 20, so 40-60 is 2-3x the minimum, reasonable for severe sinks
+            if support >= 60 or (support >= 40 and sa_frac >= 0.30):
                 if is_traced and trace_logger:
-                    quality_reason = f"support={support} >= 35" if support >= 35 else f"SA fraction={sa_frac:.2f} >= 0.30"
+                    if support >= 60:
+                        quality_reason = f"very high support={support} >= 60"
+                    else:
+                        quality_reason = f"moderate-high support={support} >= 40 AND SA fraction={sa_frac:.2f} >= 0.30"
                     trace_logger.log_filter_result(fusion_name, "sink_breakpoints", True, f"Severe sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB ({sink_count} fusions) but kept due to {quality_reason}")
                 filtered.append(r)
                 continue
@@ -208,7 +214,7 @@ def _filter_sink_breakpoints(results, user_targets=None, traced_pairs=None, trac
                 # Filter low-quality fusions in severe sinks
                 filtered_names.append(fusion_name)
                 if is_traced and trace_logger:
-                    trace_logger.log_filter_result(fusion_name, "sink_breakpoints", False, f"Breakpoint in severe sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB (appears in {sink_count} fusions, support={support} < 35 and SA={sa_frac:.2f} < 0.30)")
+                    trace_logger.log_filter_result(fusion_name, "sink_breakpoints", False, f"Breakpoint in severe sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB (appears in {sink_count} fusions, support={support} < 60 and (support < 40 or SA < 0.30))")
                 continue
         
         # 3. Regular sink: Apply exemptions for high-quality fusions
