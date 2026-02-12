@@ -83,7 +83,9 @@ def get_nearest_exon_boundary(exon_boundaries, chrom, pos, window=20):
     """
     Find the distance to the nearest exon boundary.
     Returns: (distance, is_near_boundary) where is_near_boundary is True if within window bp
+    Optimized: uses sorted list and binary search for O(log n) lookup instead of O(n).
     """
+    import bisect
     clean_chrom = _normalize_chrom(chrom)
     if clean_chrom not in exon_boundaries:
         return (None, False)
@@ -92,10 +94,27 @@ def get_nearest_exon_boundary(exon_boundaries, chrom, pos, window=20):
     if not boundaries:
         return (None, False)
     
-    # Find nearest boundary
+    # Convert to sorted list if not already (cache this if called frequently)
+    if not isinstance(boundaries, list):
+        boundaries = sorted(boundaries)
+        exon_boundaries[clean_chrom] = boundaries  # Cache sorted list
+    elif not isinstance(boundaries, list) or len(boundaries) > 1 and boundaries[0] > boundaries[-1]:
+        # Check if sorted, if not, sort and cache
+        boundaries = sorted(boundaries)
+        exon_boundaries[clean_chrom] = boundaries
+    
+    # Binary search for nearest boundary
+    idx = bisect.bisect_left(boundaries, pos)
     min_dist = None
-    for boundary_pos in boundaries:
-        dist = abs(pos - boundary_pos)
+    
+    # Check boundary at idx (if exists)
+    if idx < len(boundaries):
+        dist = abs(boundaries[idx] - pos)
+        min_dist = dist
+    
+    # Check boundary before idx (if exists)
+    if idx > 0:
+        dist = abs(boundaries[idx - 1] - pos)
         if min_dist is None or dist < min_dist:
             min_dist = dist
     

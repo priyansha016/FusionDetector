@@ -360,39 +360,3 @@ class FusionAssembler:
                     pos = start + best_offset
                 scored.append((pos, best_score))
         return scored
-
-    @staticmethod
-    def _align_clips_to_ref(fasta, chrom, center_pos, clips, window, use_end=False, min_identity=0.75):
-        """Find best alignment of each clip to reference (Factera/JuLI: align clip to ref for exact junction).
-        use_end=True (pos_a): return last base of 5' segment; if clip aligned as RC, last base = left end of alignment.
-        use_end=False (pos_b): return first base of 3' segment = start of alignment."""
-        ref_len = fasta.get_reference_length(chrom)
-        start = max(0, center_pos - window)
-        end = min(ref_len, center_pos + window)
-        ref_seq = fasta.fetch(chrom, start, end).upper()
-        if len(ref_seq) < 10:
-            return []
-        rc_table = str.maketrans("ACGT", "TGCA")
-        positions = []
-        for _approx, clip_seq in clips:
-            if len(clip_seq) > len(ref_seq):
-                continue
-            best_offset = None
-            best_score = -1
-            best_was_rc = False
-            for is_rc, seq in enumerate((clip_seq, clip_seq[::-1].translate(rc_table))):
-                for offset in range(0, len(ref_seq) - len(seq) + 1):
-                    score = sum(1 for a, b in zip(seq, ref_seq[offset : offset + len(seq)]) if a == b)
-                    if score > best_score:
-                        best_score = score
-                        best_offset = offset
-                        best_was_rc = bool(is_rc)
-            min_score = max(5, int(len(clip_seq) * min_identity))
-            if best_offset is not None and best_score >= min_score:
-                # use_end=True: last base of 5' segment. If segment on minus strand (RC), last base = left end.
-                if use_end:
-                    pos = (start + best_offset) if best_was_rc else (start + best_offset + len(clip_seq) - 1)
-                else:
-                    pos = start + best_offset  # first base of 3' segment
-                positions.append(pos)
-        return positions

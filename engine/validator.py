@@ -39,30 +39,30 @@ class FusionValidator:
             if g1.startswith("ZNF") or g1.startswith("GYP"):
                 return (True, f"FILTERED: Same gene family ({g1[:3]})")
 
-        # 2. Intra-chromosomal Neighbor Filter (500KB: likely read-through)
+        # 2. Intra-chromosomal Neighbor Filter (1MB: likely read-through or local mapping noise)
+        # Increased from 500KB to 1MB to catch ALK cluster artifacts (genes within 1MB window)
         if chrom_a == chrom_b:
             try:
                 dist = abs(int(pos_a) - int(pos_b))
-                if dist < 500000:  # 500KB: likely neighbor/read-through (e.g. GYPA-GYPE)
-                    return (True, f"FILTERED: Intra-chromosomal distance {dist:,}bp < 500KB")
+                if dist < 1_000_000:  # 1MB: likely neighbor/read-through or local mapping noise
+                    # Exception: High support (>50) AND high SA fraction (>0.3) might be real inversion
+                    if support is None or support <= 50 or sa_fraction is None or sa_fraction <= 0.3:
+                        return (True, f"FILTERED: Intra-chromosomal distance {dist:,}bp < 1MB (likely mapping artifact)")
                 # Do NOT require SA tags for same-chromosome fusions (e.g. EML4-ALK on chr2);
                 # legacy BAMs may have low SA fraction but true fusions.
-                # Same-chromosome fusions >500KB apart are handled by other filters (support thresholds, etc.)
+                # Same-chromosome fusions >1MB apart are handled by other filters (support thresholds, etc.)
             except (ValueError, TypeError):
                 pass
         
         # 3. Blacklist Check
-        # Filter if any gene has blacklisted prefix AND support is low (< 40)
-        # This filters low-to-moderate support fusions involving problematic gene prefixes
+        # Filter ALL fusions involving blacklisted genes (LINC, LOC, etc.) regardless of support
+        # These are typically repetitive elements or non-coding RNAs that cause mapping artifacts
+        # No exceptions - if any gene is blacklisted, filter the fusion
         g1_blacklisted = any(g1.startswith(p) for p in self.blacklist_prefixes)
         g2_blacklisted = any(g2.startswith(p) for p in self.blacklist_prefixes)
         if g1_blacklisted or g2_blacklisted:
             matched_prefix = next((p for p in self.blacklist_prefixes if g1.startswith(p) or g2.startswith(p)), "unknown")
-            # Filter if any gene is blacklisted AND support < 40
-            if support is not None and support < 40:
-                return (True, f"FILTERED: Blacklisted prefix ({matched_prefix}) with support={support} < 40")
-            # For high-support fusions with blacklisted genes, allow them through
-            # (e.g., ALK-LINC00486 with high support might be real)
+            return (True, f"FILTERED: Blacklisted prefix ({matched_prefix}) - these genes cause mapping artifacts")
         
         # 4. Adaptive support threshold: stricter when combined with suspicious signals
         # Base threshold: 20 reads (true fusions can have 20-25 reads)

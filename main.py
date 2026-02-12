@@ -26,6 +26,8 @@ class TraceLogger:
     """Thread-safe logger for writing trace information to a log file."""
     _initialized_files = set()
     _init_lock = threading.Lock()
+    _file_handles = {}  # Cache open file handles per process
+    _handle_lock = threading.Lock()
     
     def __init__(self, log_file_path):
         self.log_file_path = log_file_path
@@ -38,11 +40,26 @@ class TraceLogger:
                     f.write(f"# Log file: {log_file_path}\n\n")
                 TraceLogger._initialized_files.add(log_file_path)
     
+    def _get_file_handle(self):
+        """Get or create a buffered file handle for this logger."""
+        # Use process ID to avoid sharing handles across processes
+        import os
+        pid = os.getpid()
+        key = (pid, self.log_file_path)
+        
+        with TraceLogger._handle_lock:
+            if key not in TraceLogger._file_handles:
+                # Open in append mode with buffering
+                TraceLogger._file_handles[key] = open(self.log_file_path, 'a', buffering=8192)
+            return TraceLogger._file_handles[key]
+    
     def log(self, message):
-        """Write a trace message to the log file (thread-safe, append mode)."""
+        """Write a trace message to the log file (thread-safe, buffered)."""
         with self.lock:
-            with open(self.log_file_path, 'a') as f:
-                f.write(f"{message}\n")
+            f = self._get_file_handle()
+            f.write(f"{message}\n")
+            # Flush periodically but not every line (buffering helps performance)
+            if f.tell() % 65536 < len(message):  # Flush every ~64KB
                 f.flush()
     
     def log_filter_result(self, fusion_name, filter_name, passed, reason=None):
@@ -74,16 +91,16 @@ def _serialize_read(read):
 
 def _process_one_item(item):
     """Unpack tuple for imap_unordered (worker receives single argument)."""
-    # Handle both old format (7 args) and new format (10 args with ref_path and trace params)
-    if len(item) == 7:
-        # Old format: no ref_path, no trace params - add None for ref_path and trace params
+    # Current format: 10 args (bam_path, fasta_path, ref_path, sample_name, gene_pair, reads_dicts, user_targets, min_support, traced_pairs, trace_log_path)
+    if len(item) == 10:
+        return _process_one_gene_pair(*item)
+    # Legacy compatibility (should not be needed in current codebase)
+    elif len(item) == 7:
         return _process_one_gene_pair(*item[:2], None, *item[2:], None, None)
     elif len(item) == 9:
-        # Format with trace params but no ref_path - insert None for ref_path
         return _process_one_gene_pair(item[0], item[1], None, *item[2:])
     else:
-        # New format: includes ref_path, traced_pairs and trace_log_path
-        return _process_one_gene_pair(*item)
+        raise ValueError(f"Unexpected item length: {len(item)} (expected 10)")
 
 
 def _normalize_gene_name(gene):
@@ -100,29 +117,28 @@ def _normalize_gene_name(gene):
 def _filter_sink_breakpoints(results, user_targets=None, traced_pairs=None, trace_logger=None, filter_log_file=None):
     """
     Sink filter: a breakpoint region that appears in many different fusions is likely
-    a mapping artifact (e.g. chr2:33141xxx "fusing" with many genes). Drop any fusion
-    that has either breakpoint in such a sink. Preserves real fusions (e.g. CD74-ROS1)
-    which have unique breakpoints.
+    a mapping artifact (e.g. chr2:33141xxx "fusing" with many genes). 
+    
+    Smart filtering: Only filters low-quality fusions in sink regions. Preserves:
+    - Target genes (user_targets)
+    - High-support fusions (support >= 30)
+    - High SA-fraction fusions (SA >= 0.25)
+    
+    This prevents filtering true fusions like ROS1-SLC34A2 that have high support
+    but happen to be in regions with many false positives.
     """
     if not results or len(results) < 2:
         return results, []
     BIN_KB = 10  # 10kb bin (same order as cluster window)
     SINK_THRESHOLD = 3  # bin in >3 fusions = sink
+    MIN_SUPPORT_EXEMPT = 30  # Fusions with support >= this are exempt from sink filtering
+    MIN_SA_EXEMPT = 0.25  # Fusions with SA fraction >= this are exempt from sink filtering
+    
     bin_counts = Counter()
-    for r in results:
-        chrom_a, pos_a = r.get("chrom_a", ""), r.get("pos_a", 0)
-        chrom_b, pos_b = r.get("chrom_b", ""), r.get("pos_b", 0)
-        bin_a = (chrom_a, pos_a // (BIN_KB * 1000)) if chrom_a and pos_a is not None else None
-        bin_b = (chrom_b, pos_b // (BIN_KB * 1000)) if chrom_b and pos_b is not None else None
-        if bin_a:
-            bin_counts[bin_a] += 1
-        if bin_b and bin_b != bin_a:
-            bin_counts[bin_b] += 1
-    sink_bins = {b for b, c in bin_counts.items() if c > SINK_THRESHOLD}
-    if not sink_bins:
-        return results, []
-    filtered = []
-    filtered_names = []
+    # Pre-compute bins and normalized names
+    fusion_data = []
+    user_targets = set(user_targets) if user_targets else set()
+    
     for r in results:
         chrom_a, pos_a = r.get("chrom_a", ""), r.get("pos_a", 0)
         chrom_b, pos_b = r.get("chrom_b", ""), r.get("pos_b", 0)
@@ -131,16 +147,83 @@ def _filter_sink_breakpoints(results, user_targets=None, traced_pairs=None, trac
         g_a_norm = _normalize_gene_name(r.get("gene_a", ""))
         g_b_norm = _normalize_gene_name(r.get("gene_b", ""))
         fusion_name = f"{g_a_norm}-{g_b_norm}"
+        support = r.get("support", 0)
+        sa_frac = r.get("sa_fraction", 0.0)
+        is_target = g_a_norm in user_targets or g_b_norm in user_targets
+        fusion_data.append((r, bin_a, bin_b, fusion_name, g_a_norm, g_b_norm, support, sa_frac, is_target))
+        
+        if bin_a:
+            bin_counts[bin_a] += 1
+        if bin_b and bin_b != bin_a:
+            bin_counts[bin_b] += 1
+    
+    sink_bins = {b for b, c in bin_counts.items() if c > SINK_THRESHOLD}
+    if not sink_bins:
+        return results, []
+    
+    # Identify severe sinks (appear in many fusions) - these filter ALL fusions regardless of support
+    SEVERE_SINK_THRESHOLD = 5  # If a bin appears in >= 5 fusions, it's a severe sink
+    severe_sink_bins = {b for b, c in bin_counts.items() if c >= SEVERE_SINK_THRESHOLD}
+    
+    filtered = []
+    filtered_names = []
+    for r, bin_a, bin_b, fusion_name, g_a_norm, g_b_norm, support, sa_frac, is_target in fusion_data:
         is_traced = traced_pairs and ((g_a_norm, g_b_norm) in traced_pairs or (g_b_norm, g_a_norm) in traced_pairs)
         
-        if bin_a in sink_bins or bin_b in sink_bins:
+        # Check if breakpoints are in sink bins
+        bp_a_in_sink = bin_a in sink_bins if bin_a else False
+        bp_b_in_sink = bin_b in sink_bins if bin_b else False
+        bp_a_in_severe_sink = bin_a in severe_sink_bins if bin_a else False
+        bp_b_in_severe_sink = bin_b in severe_sink_bins if bin_b else False
+        
+        # Exemptions: don't filter if...
+        # 1. Target gene (user wants to see these) - always exempt
+        if is_target:
+            if is_traced and trace_logger:
+                trace_logger.log_filter_result(fusion_name, "sink_breakpoints", True, "Target gene (bypasses filter)")
+            filtered.append(r)
+            continue
+        
+        # 2. Severe sink: Filter ALL fusions in severe sinks regardless of support
+        # (e.g., chr2:33141xxx appearing in 6+ fusions is definitely an artifact)
+        if bp_a_in_severe_sink or bp_b_in_severe_sink:
             filtered_names.append(fusion_name)
             if is_traced and trace_logger:
-                sink_bin = bin_a if bin_a in sink_bins else bin_b
+                sink_bin = bin_a if bp_a_in_severe_sink else bin_b
+                sink_count = bin_counts[sink_bin]
+                trace_logger.log_filter_result(fusion_name, "sink_breakpoints", False, f"Breakpoint in severe sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB (appears in {sink_count} fusions - filtering all regardless of support)")
+            continue
+        
+        # 3. Regular sink: Apply exemptions for high-quality fusions
+        if bp_a_in_sink or bp_b_in_sink:
+            # High support exemption (for moderate sinks with 3-4 fusions)
+            if support >= MIN_SUPPORT_EXEMPT:
+                if is_traced and trace_logger:
+                    sink_bin = bin_a if bp_a_in_sink else bin_b
+                    sink_info = f" (breakpoint in sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB but support={support} >= {MIN_SUPPORT_EXEMPT})"
+                    trace_logger.log_filter_result(fusion_name, "sink_breakpoints", True, f"High support exempt{sink_info}")
+                filtered.append(r)
+                continue
+            
+            # High SA fraction exemption
+            if sa_frac >= MIN_SA_EXEMPT:
+                if is_traced and trace_logger:
+                    sink_bin = bin_a if bp_a_in_sink else bin_b
+                    sink_info = f" (breakpoint in sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB but SA fraction={sa_frac:.2f} >= {MIN_SA_EXEMPT})"
+                    trace_logger.log_filter_result(fusion_name, "sink_breakpoints", True, f"High SA fraction exempt{sink_info}")
+                filtered.append(r)
+                continue
+            
+            # Filter low-quality fusions in regular sinks
+            filtered_names.append(fusion_name)
+            if is_traced and trace_logger:
+                sink_bin = bin_a if bp_a_in_sink else bin_b
                 trace_logger.log_filter_result(fusion_name, "sink_breakpoints", False, f"Breakpoint in sink bin {sink_bin[0]}:{sink_bin[1]*BIN_KB}KB (appears in {bin_counts[sink_bin]} fusions)")
             continue
+        
+        # Not filtered - keep it
         if is_traced and trace_logger:
-            trace_logger.log_filter_result(fusion_name, "sink_breakpoints", True, "Breakpoints not in sink bins")
+            trace_logger.log_filter_result(fusion_name, "sink_breakpoints", True, "Breakpoints not in sink bins or exempted")
         filtered.append(r)
     
     return filtered, filtered_names
@@ -160,7 +243,14 @@ def _filter_breakpoint_clusters(results, user_targets=None, traced_pairs=None, t
     bp_clusters = {}  # (chrom, cluster_pos) -> set of fusion indices
     fusion_list = list(results)  # Keep reference to original list
     
-    # First pass: build clusters
+    # Pre-normalize gene names once
+    normalized_genes = {}
+    for idx, r in enumerate(fusion_list):
+        g_a = r.get("gene_a", "")
+        g_b = r.get("gene_b", "")
+        normalized_genes[idx] = (_normalize_gene_name(g_a), _normalize_gene_name(g_b))
+    
+    # First pass: build clusters (optimized - check existing clusters more efficiently)
     for idx, r in enumerate(fusion_list):
         bp_a = (r.get("chrom_a", ""), r.get("pos_a", 0))
         bp_b = (r.get("chrom_b", ""), r.get("pos_b", 0))
@@ -168,10 +258,11 @@ def _filter_breakpoint_clusters(results, user_targets=None, traced_pairs=None, t
         # Check both breakpoints for clustering
         assigned_cluster = None
         for chrom, pos in [bp_a, bp_b]:
-            # Find existing cluster
-            for (c, cluster_pos) in list(bp_clusters.keys()):
+            # Find existing cluster - check only clusters for this chromosome
+            for cluster_key in bp_clusters.keys():
+                c, cluster_pos = cluster_key
                 if c == chrom and abs(pos - cluster_pos) <= CLUSTER_WINDOW:
-                    assigned_cluster = (c, cluster_pos)
+                    assigned_cluster = cluster_key
                     break
             
             if assigned_cluster:
@@ -185,51 +276,49 @@ def _filter_breakpoint_clusters(results, user_targets=None, traced_pairs=None, t
             bp_clusters[bp_a] = {idx}
     
     # Filter clusters with >=2 fusions (tuned for 5–7 FP target)
-    suspicious_clusters = {}
-    for cluster_key, fusion_indices in bp_clusters.items():
-        if len(fusion_indices) >= 2:
-            suspicious_clusters[cluster_key] = fusion_indices
+    suspicious_clusters = {k: v for k, v in bp_clusters.items() if len(v) >= 2}
     
     if not suspicious_clusters:
         return results, []
     
+    # Build index: fusion_idx -> cluster_key for O(1) lookup
+    fusion_to_cluster = {}
+    for cluster_key, fusion_indices in suspicious_clusters.items():
+        for idx in fusion_indices:
+            fusion_to_cluster[idx] = cluster_key
+    
     # Filter fusions in suspicious clusters, but keep the highest support one per cluster
+    # First pass: find best fusion per cluster
+    cluster_best_idx = {}  # cluster_key -> index of best fusion
+    for idx, r in enumerate(fusion_list):
+        in_cluster = fusion_to_cluster.get(idx)
+        if in_cluster:
+            support = r.get("support", 0)
+            if in_cluster not in cluster_best_idx:
+                cluster_best_idx[in_cluster] = idx
+            else:
+                best_support = fusion_list[cluster_best_idx[in_cluster]].get("support", 0)
+                if support > best_support:
+                    cluster_best_idx[in_cluster] = idx
+    
+    # Second pass: build filtered list and track removals
     filtered = []
-    cluster_best = {}  # cluster_key -> best fusion
     removed_fusions = []
+    keep_indices = set(cluster_best_idx.values())  # Indices to keep from clusters
     
     for idx, r in enumerate(fusion_list):
-        bp_a = (r.get("chrom_a", ""), r.get("pos_a", 0))
-        bp_b = (r.get("chrom_b", ""), r.get("pos_b", 0))
-        support = r.get("support", 0)
-        g_a_norm = _normalize_gene_name(r.get("gene_a", ""))
-        g_b_norm = _normalize_gene_name(r.get("gene_b", ""))
+        g_a_norm, g_b_norm = normalized_genes[idx]
         fusion_name = f"{g_a_norm}-{g_b_norm}"
         is_traced = traced_pairs and ((g_a_norm, g_b_norm) in traced_pairs or (g_b_norm, g_a_norm) in traced_pairs)
         
-        # Check if this fusion is in any suspicious cluster
-        in_cluster = None
-        for cluster_key, fusion_indices in suspicious_clusters.items():
-            if idx in fusion_indices:
-                in_cluster = cluster_key
-                break
-        
+        in_cluster = fusion_to_cluster.get(idx)
         if in_cluster:
-            # Keep only the highest support fusion per cluster
-            if in_cluster not in cluster_best or support > cluster_best[in_cluster].get("support", 0):
-                # Remove previous best if exists
-                if in_cluster in cluster_best:
-                    prev_fusion = cluster_best[in_cluster]
-                    prev_g_a = _normalize_gene_name(prev_fusion.get("gene_a", ""))
-                    prev_g_b = _normalize_gene_name(prev_fusion.get("gene_b", ""))
-                    prev_fusion_name = f"{prev_g_a}-{prev_g_b}"
-                    removed_fusions.append((prev_fusion_name, in_cluster, cluster_best[in_cluster].get("support", 0)))
-                    if prev_fusion in filtered:
-                        filtered.remove(prev_fusion)
-                cluster_best[in_cluster] = r
+            if idx == cluster_best_idx[in_cluster]:
+                # This is the best fusion in the cluster, keep it
                 filtered.append(r)
             else:
-                removed_fusions.append((fusion_name, in_cluster, support))
+                # This fusion is in a cluster but not the best, remove it
+                removed_fusions.append((fusion_name, in_cluster, r.get("support", 0)))
         else:
             # Not in a suspicious cluster, keep it
             if is_traced and trace_logger:
@@ -252,45 +341,61 @@ def _filter_duplicate_breakpoints(results, user_targets=None, traced_pairs=None,
     Filter duplicate breakpoints: if the same chromosome:position appears in multiple
     fusions, keep only the one with highest support. This handles cases like GLI4-LRMDA
     and EP400-GLI4 sharing the same breakpoint (chr8:144351031).
+    Optimized: uses breakpoint -> result mapping for O(1) lookup instead of O(n) iteration.
     """
     if not results:
         return results, []
     
     # Track which breakpoints we've seen and their best fusion
-    bp_to_result = {}
+    bp_to_result = {}  # (bp_a, bp_b) -> result dict
+    bp_set = set()  # Set of all breakpoints seen (for fast lookup)
     removed_fusions = []
-    for r in results:
+    
+    # Pre-normalize gene names once
+    normalized_names = {}
+    for idx, r in enumerate(results):
+        g_a_norm = _normalize_gene_name(r.get("gene_a", ""))
+        g_b_norm = _normalize_gene_name(r.get("gene_b", ""))
+        normalized_names[idx] = (g_a_norm, g_b_norm, f"{g_a_norm}-{g_b_norm}")
+    
+    for idx, r in enumerate(results):
         bp_a = (r.get("chrom_a", ""), r.get("pos_a", 0))
         bp_b = (r.get("chrom_b", ""), r.get("pos_b", 0))
         fusion_key = (bp_a, bp_b)
-        g_a_norm = _normalize_gene_name(r.get("gene_a", ""))
-        g_b_norm = _normalize_gene_name(r.get("gene_b", ""))
-        fusion_name = f"{g_a_norm}-{g_b_norm}"
+        g_a_norm, g_b_norm, fusion_name = normalized_names[idx]
         
-        # Check if either breakpoint matches an existing fusion's breakpoints
+        # Check if any breakpoint matches an existing fusion's breakpoints (O(1) lookup)
         found_dup = False
-        for existing_key, existing_r in list(bp_to_result.items()):
-            existing_bp_a, existing_bp_b = existing_key
-            # Check if any breakpoint overlaps
-            if (bp_a == existing_bp_a or bp_a == existing_bp_b or 
-                bp_b == existing_bp_a or bp_b == existing_bp_b):
-                # Same breakpoint found - keep the one with higher support
-                existing_support = existing_r.get("support", 0)
-                current_support = r.get("support", 0)
-                if current_support > existing_support:
-                    # Remove old one, keep new one
-                    existing_g_a = _normalize_gene_name(existing_r.get("gene_a", ""))
-                    existing_g_b = _normalize_gene_name(existing_r.get("gene_b", ""))
-                    existing_fusion_name = f"{existing_g_a}-{existing_g_b}"
-                    removed_fusions.append((existing_fusion_name, existing_support))
-                    bp_to_result[existing_key] = r
-                else:
-                    removed_fusions.append((fusion_name, current_support))
-                found_dup = True
-                break
+        for bp in [bp_a, bp_b]:
+            if bp in bp_set:
+                # Find the fusion(s) with this breakpoint
+                for existing_key, existing_r in bp_to_result.items():
+                    existing_bp_a, existing_bp_b = existing_key
+                    if bp == existing_bp_a or bp == existing_bp_b:
+                        # Same breakpoint found - keep the one with higher support
+                        existing_support = existing_r.get("support", 0)
+                        current_support = r.get("support", 0)
+                        if current_support > existing_support:
+                            # Remove old one, keep new one
+                            existing_idx = existing_r.get("_idx")
+                            if existing_idx is not None:
+                                existing_g_a, existing_g_b, existing_fusion_name = normalized_names[existing_idx]
+                                removed_fusions.append((existing_fusion_name, existing_support))
+                            # Update mapping
+                            bp_to_result[existing_key] = r
+                            r["_idx"] = idx
+                        else:
+                            removed_fusions.append((fusion_name, current_support))
+                        found_dup = True
+                        break
+                if found_dup:
+                    break
         
         if not found_dup:
             bp_to_result[fusion_key] = r
+            r["_idx"] = idx
+            bp_set.add(bp_a)
+            bp_set.add(bp_b)
     
     # Log trace for removed fusions
     if traced_pairs and trace_logger:
@@ -311,20 +416,24 @@ def _deduplicate_gene_aliases(results, user_targets=None, traced_pairs=None, tra
     if not results:
         return results, []
     
+    # Pre-normalize gene names once
+    normalized_names = {}
+    for idx, r in enumerate(results):
+        g_a_norm = _normalize_gene_name(r.get("gene_a", ""))
+        g_b_norm = _normalize_gene_name(r.get("gene_b", ""))
+        normalized_names[idx] = (g_a_norm, g_b_norm, f"{g_a_norm}-{g_b_norm}")
+    
     # Group by breakpoint, keep the one with highest support
-    bp_to_result = {}
+    bp_to_result = {}  # (bp_key, g_a_norm, g_b_norm) -> result dict
     removed_fusions = set()
-    for r in results:
+    for idx, r in enumerate(results):
         bp_key = (
             r.get("chrom_a", ""),
             r.get("pos_a", 0),
             r.get("chrom_b", ""),
             r.get("pos_b", 0),
         )
-        # Normalize gene names for comparison
-        g_a_norm = _normalize_gene_name(r.get("gene_a", ""))
-        g_b_norm = _normalize_gene_name(r.get("gene_b", ""))
-        fusion_name = f"{g_a_norm}-{g_b_norm}"
+        g_a_norm, g_b_norm, fusion_name = normalized_names[idx]
         norm_key = (bp_key, g_a_norm, g_b_norm)
         
         if norm_key not in bp_to_result:
@@ -335,9 +444,12 @@ def _deduplicate_gene_aliases(results, user_targets=None, traced_pairs=None, tra
             current_support = r.get("support", 0)
             if current_support > existing_support:
                 # Remove old one, keep new one
-                existing_fusion_name = f"{_normalize_gene_name(bp_to_result[norm_key].get('gene_a', ''))}-{_normalize_gene_name(bp_to_result[norm_key].get('gene_b', ''))}"
-                removed_fusions.add(existing_fusion_name)
+                existing_idx = bp_to_result[norm_key].get("_idx")
+                if existing_idx is not None:
+                    _, _, existing_fusion_name = normalized_names[existing_idx]
+                    removed_fusions.add(existing_fusion_name)
                 bp_to_result[norm_key] = r
+                r["_idx"] = idx
             else:
                 removed_fusions.add(fusion_name)
     
@@ -390,7 +502,8 @@ def _filter_low_confidence(results, user_targets, traced_pairs=None, trace_logge
 
 
 # Global threshold: same for all samples (genes appearing this many times = repeating)
-REPEATING_GENE_THRESHOLD = 3
+# Lowered from 3 to 2 to catch genes like LINC00486 that appear in many fusions
+REPEATING_GENE_THRESHOLD = 2
 
 
 def _filter_exon_boundaries(results, exon_boundaries, user_targets, traced_pairs=None, trace_logger=None, filter_log_file=None):
@@ -464,6 +577,90 @@ def _filter_exon_boundaries(results, exon_boundaries, user_targets, traced_pairs
     return filtered, filtered_names
 
 
+def _filter_target_gene_quality(results, user_targets, traced_pairs=None, trace_logger=None, filter_log_file=None):
+    """
+    Filter target gene fusions to keep only high-quality ones.
+    When a target gene (e.g., ROS1) appears in many fusions, only keep the best ones.
+    
+    Strategy:
+    - Keep top N fusions per target gene (by support)
+    - Apply quality thresholds (support, SA fraction)
+    - Keep unique breakpoints (if same breakpoint, keep highest support)
+    """
+    if not results or not user_targets:
+        return results, []
+    
+    user_targets = set(user_targets)
+    filtered = []
+    filtered_names = []
+    
+    # Group target gene fusions by target gene
+    target_fusions = {}  # target_gene -> list of (fusion_dict, fusion_name, support, sa_frac)
+    non_target_fusions = []
+    
+    for r in results:
+        g_a = _normalize_gene_name(r.get("gene_a", ""))
+        g_b = _normalize_gene_name(r.get("gene_b", ""))
+        fusion_name = f"{g_a}-{g_b}"
+        support = r.get("support", 0)
+        sa_frac = r.get("sa_fraction", 0.0)
+        
+        is_target_a = g_a in user_targets
+        is_target_b = g_b in user_targets
+        
+        if is_target_a or is_target_b:
+            # This fusion involves a target gene
+            target_gene = g_a if is_target_a else g_b
+            if target_gene not in target_fusions:
+                target_fusions[target_gene] = []
+            target_fusions[target_gene].append((r, fusion_name, support, sa_frac))
+        else:
+            # Non-target fusion - keep as-is
+            non_target_fusions.append(r)
+    
+    # Process each target gene's fusions
+    MIN_TARGET_SUPPORT = 25  # Minimum support for target gene fusions
+    MIN_TARGET_SA = 0.15  # Minimum SA fraction for target gene fusions
+    MAX_TARGET_FUSIONS_PER_GENE = 5  # Keep top 5 fusions per target gene
+    
+    for target_gene, fusions in target_fusions.items():
+        # Sort by support (descending), then by SA fraction
+        sorted_fusions = sorted(fusions, key=lambda x: (x[2], x[3]), reverse=True)
+        
+        # Filter by quality thresholds
+        quality_fusions = [
+            (r, name, sup, sa) for r, name, sup, sa in sorted_fusions
+            if sup >= MIN_TARGET_SUPPORT and sa >= MIN_TARGET_SA
+        ]
+        
+        # If no fusions meet quality threshold, keep top 2 anyway (might be real but low quality)
+        if not quality_fusions and sorted_fusions:
+            quality_fusions = sorted_fusions[:2]
+        
+        # Keep top N fusions per target gene
+        kept_fusions = quality_fusions[:MAX_TARGET_FUSIONS_PER_GENE]
+        kept_names = {name for _, name, _, _ in kept_fusions}
+        
+        # Track filtered ones
+        for r, name, sup, sa in sorted_fusions:
+            if name in kept_names:
+                filtered.append(r)
+            else:
+                filtered_names.append(name)
+                is_traced = traced_pairs and ((name.split('-')[0], name.split('-')[1]) in traced_pairs or (name.split('-')[1], name.split('-')[0]) in traced_pairs)
+                if is_traced and trace_logger:
+                    reason = f"Target gene {target_gene}: kept top {len(kept_fusions)} fusions (support={sup}, SA={sa:.2f} not in top {MAX_TARGET_FUSIONS_PER_GENE})"
+                    trace_logger.log_filter_result(name, "target_gene_quality", False, reason)
+    
+    # Add non-target fusions
+    filtered.extend(non_target_fusions)
+    
+    if filtered_names and filter_log_file:
+        filter_log_file.write(f"  Filtered target gene fusions: {', '.join(filtered_names)}\n")
+    
+    return filtered, filtered_names
+
+
 def _filter_repeating_genes(results, user_targets, traced_pairs=None, trace_logger=None, filter_log_file=None):
     """
     Global filter: genes appearing >= REPEATING_GENE_THRESHOLD times (in either column)
@@ -472,23 +669,31 @@ def _filter_repeating_genes(results, user_targets, traced_pairs=None, trace_logg
     """
     if not results:
         return results, []
-    # Count each gene in both columns (global rule: use both gene_a and gene_b)
-    gene_counts = {}
-    for r in results:
+    
+    # Pre-normalize gene names once
+    normalized_names = {}
+    for idx, r in enumerate(results):
         g_a = _normalize_gene_name(r.get("gene_a", ""))
         g_b = _normalize_gene_name(r.get("gene_b", ""))
+        normalized_names[idx] = (g_a, g_b, f"{g_a}-{g_b}")
+    
+    # Count each gene in both columns (global rule: use both gene_a and gene_b)
+    gene_counts = {}
+    for idx, r in enumerate(results):
+        g_a, g_b, _ = normalized_names[idx]
         gene_counts[g_a] = gene_counts.get(g_a, 0) + 1
         gene_counts[g_b] = gene_counts.get(g_b, 0) + 1
+    
     repeating = {g for g, c in gene_counts.items() if c >= REPEATING_GENE_THRESHOLD}
     if not repeating:
         return results, []
+    
     user_targets = set(user_targets) if user_targets else set()
     filtered = []
     filtered_names = []
-    for r in results:
-        g_a = _normalize_gene_name(r.get("gene_a", ""))
-        g_b = _normalize_gene_name(r.get("gene_b", ""))
-        fusion_name = f"{g_a}-{g_b}"
+    
+    for idx, r in enumerate(results):
+        g_a, g_b, fusion_name = normalized_names[idx]
         support = r.get("support", 0)
         sa_frac = r.get("sa_fraction", 1.0)
         is_target = g_a in user_targets or g_b in user_targets
@@ -501,17 +706,22 @@ def _filter_repeating_genes(results, user_targets, traced_pairs=None, trace_logg
                 trace_logger.log_filter_result(fusion_name, "repeating_genes", True, "Target gene (bypasses filter)")
             filtered.append(r)
             continue
-        if both_repeating and support < 40:
-            filtered_names.append(fusion_name)
-            if is_traced and trace_logger:
-                trace_logger.log_filter_result(fusion_name, "repeating_genes", False, f"Both genes repeating ({g_a} count={gene_counts[g_a]}, {g_b} count={gene_counts[g_b]}), support={support} < 40")
-            continue
-        if one_repeating and support < 35 and sa_frac < 0.25:
-            filtered_names.append(fusion_name)
+        # More aggressive filtering for repeating genes (catches LINC00486, ALK clusters, etc.)
+        if both_repeating:
+            # Both genes repeating - filter unless very high support
+            if support < 50:
+                filtered_names.append(fusion_name)
+                if is_traced and trace_logger:
+                    trace_logger.log_filter_result(fusion_name, "repeating_genes", False, f"Both genes repeating ({g_a} count={gene_counts[g_a]}, {g_b} count={gene_counts[g_b]}), support={support} < 50")
+                continue
+        elif one_repeating:
+            # One gene repeating - filter unless moderate-high support AND good SA evidence
             repeating_gene = g_a if g_a in repeating else g_b
-            if is_traced and trace_logger:
-                trace_logger.log_filter_result(fusion_name, "repeating_genes", False, f"{repeating_gene} repeating (count={gene_counts[repeating_gene]}), support={support} < 35 and SA fraction={sa_frac:.2f} < 0.25")
-            continue
+            if support < 40 or (support < 50 and sa_frac < 0.30):
+                filtered_names.append(fusion_name)
+                if is_traced and trace_logger:
+                    trace_logger.log_filter_result(fusion_name, "repeating_genes", False, f"{repeating_gene} repeating (count={gene_counts[repeating_gene]}), support={support} < 40 or (support < 50 and SA fraction={sa_frac:.2f} < 0.30)")
+                continue
         if is_traced and trace_logger:
             reason_parts = []
             if both_repeating:
@@ -824,6 +1034,13 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
             final_results, filtered_names = _filter_repeating_genes(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After repeating_genes: {len(final_results)} fusions (removed {removed_count})\n")
+            if filtered_names:
+                filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
+            # Target gene quality filter: keep only high-quality target gene fusions
+            before_count = len(final_results)
+            final_results, filtered_names = _filter_target_gene_quality(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
+            removed_count = before_count - len(final_results)
+            filter_log_file.write(f"After target_gene_quality: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
                 filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
             # Exon boundary check: only check final fusions (post-processing, faster)
