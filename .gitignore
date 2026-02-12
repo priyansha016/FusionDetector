@@ -5,7 +5,6 @@ __pycache__/
 *.pyd
 .Python
 Test/
-References_Hg19/
 *.bai
 *.fai
 hg19.p13.plusMT.no_alt_analysis_set.bwa_index.tar.gz
@@ -39,3 +38,6 @@ scripts/run_and_evaluate.sh
 *.md
 !README.md
 design-log/
+
+# Build files
+Makefile
