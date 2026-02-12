@@ -119,9 +119,9 @@ class FusionValidator:
                 # Support 22-23: require SA >= 0.25 (stricter - these are very common FPs)
                 if support is not None and 22 <= support <= 23 and sa_fraction < 0.25:
                     return (True, f"FILTERED: Inter-chromosomal, support={support} <= 23 and SA fraction={sa_fraction:.2f} < 0.25")
-                # Support 24: require SA >= 0.20
-                if support is not None and support == 24 and sa_fraction < 0.20:
-                    return (True, f"FILTERED: Inter-chromosomal, support={support} == 24 and SA fraction={sa_fraction:.2f} < 0.20")
+                # Support 24: require SA >= 0.15 (slightly more lenient to preserve borderline true fusions)
+                if support is not None and support == 24 and sa_fraction < 0.15:
+                    return (True, f"FILTERED: Inter-chromosomal, support={support} == 24 and SA fraction={sa_fraction:.2f} < 0.15")
                 # Support 25-28: require SA >= 0.15
                 if support is not None and 25 <= support <= 28 and sa_fraction < 0.15:
                     return (True, f"FILTERED: Inter-chromosomal, support={support} <= 28 and SA fraction={sa_fraction:.2f} < 0.15")
