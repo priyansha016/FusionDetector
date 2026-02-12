@@ -41,3 +41,7 @@ design-log/
 
 # Build files
 Makefile
+
+# Large reference files (should not be in Git)
+*.fa
+References_Hg19/hg19.fa
