@@ -39,6 +39,9 @@ scripts/run_and_evaluate.sh
 !README.md
 design-log/
 
+# Internal presentation notes (not for repo)
+TEAM_PRESENTATION.md
+
 # Build files
 Makefile
 

@@ -778,7 +778,8 @@ REPEATING_GENE_THRESHOLD = 2
 def _filter_exon_boundaries(results, exon_boundaries, user_targets, traced_pairs=None, trace_logger=None, filter_log_file=None):
     """
     Post-processing filter: Check if breakpoints are near exon boundaries.
-    Real fusions typically occur at exon boundaries. Filter breakpoints far from exon boundaries
+    DNA breakpoints can occur anywhere (introns, exons, boundaries), but breakpoints near exon 
+    boundaries are statistically more likely to be real. Filter breakpoints far from exon boundaries
     if they also have low support/SA evidence (conservative: only filter if multiple conditions met).
     
     NOTE: Currently disabled by default - may be too aggressive. Enable by uncommenting in process_sample.

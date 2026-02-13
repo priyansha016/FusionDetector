@@ -108,26 +108,9 @@ Results are written to `<outdir>/<sample_name>_fusions.tsv` with the following c
 - `pos_a`, `pos_b`: Breakpoint positions (1-based)
 - `support`: Number of supporting reads
 
-## How FusionDetector Differs from Other Tools
+## Key Advantages
 
-1. **BAM-Type Awareness**: Unlike tools that assume a specific BAM format, FusionDetector automatically adapts to both modern aligners (BWA-MEM, STAR) and legacy alignments (bwa-sampe), ensuring broad compatibility.
-
-2. **Unified Evidence Integration**: Combines discordant pairs and split-read evidence in a single pipeline, rather than requiring separate tools for different evidence types.
-
-3. **Advanced Artifact Filtering**: Implements comprehensive false-positive reduction with **global filters only** (same thresholds for all samples):
-   - **Sink breakpoint detection**: Identifies breakpoint regions that appear in many fusions (e.g. chr2:33141xxx "fusing" with multiple genes) and filters all fusions involving such sinks
-   - **Repeating genes**: Filters genes appearing ≥3 times across fusions (checks both gene_a and gene_b columns)
-   - **Breakpoint clustering**: Groups breakpoints within 10KB and keeps only the highest-support fusion per cluster
-   - **Duplicate breakpoint removal**: Removes exact duplicate breakpoints (same chr:pos in multiple fusions)
-   - **Low-confidence filtering**: Filters fusions with support 20-21 and low SA tag fraction (<0.2)
-   - **Adaptive support/SA thresholds**: Requires higher support or SA fraction when other suspicious signals are present
-   - **Intra-chromosomal filtering**: Filters same-chromosome fusions <500KB apart (read-through artifacts)
-   - **Gene family/blacklist**: Filters same-family genes (ZNF, GYP) and blacklisted prefixes (RPS, HLA, LOC, etc.)
-   - **Exon boundary check**: Filters breakpoints far from exon boundaries (>50bp) when combined with low support/SA evidence (conservative filter inspired by Factera/GeneFuse)
-
-4. **Breakpoint Precision**: Uses reference FASTA for breakpoint refinement, improving accuracy especially for split-read evidence.
-
-5. **Scalable Processing**: Efficient multiprocessing architecture handles both single samples and batch processing with optimal resource utilization.
+FusionDetector is designed for BAM-based fusion detection with broad compatibility across different alignment tools (modern aligners with SA tags and legacy BAMs). Unlike tools that require FASTQ re-alignment or assume specific BAM formats, FusionDetector works directly with existing BAM files and automatically adapts to available evidence types. It combines both discordant pairs and split-read evidence in a unified pipeline, with comprehensive false-positive filtering designed to reduce artifacts while preserving true fusions. The pipeline uses global filtering thresholds (same for all samples) and includes performance optimizations for efficient processing of single samples or large batches.
 
 ## Dependencies
 
