@@ -10,16 +10,15 @@ FusionDetector identifies gene fusions from BAM files by leveraging both discord
 
 - **BAM-Type Adaptive**: Automatically detects and adapts to modern alignments (with SA tags) or legacy BAMs (discordant pairs only)
 - **Dual Evidence Support**: Uses both discordant read pairs and split-read (SA tag) evidence for comprehensive fusion detection
-- **High-Precision Filtering**: Advanced false-positive reduction through global filters (same thresholds for all samples):
-  - **Sink breakpoint filter**: Removes fusions where a breakpoint region appears in many different fusions (mapping artifacts)
-  - **Repeating genes filter**: Filters genes appearing ≥3 times across fusions (both columns checked)
-  - **Breakpoint clustering**: Groups nearby breakpoints and keeps only the best per cluster
-  - **Duplicate breakpoint removal**: Removes exact duplicate breakpoints
-  - **Low-confidence filter**: Filters very low support (20-21 reads) with minimal SA evidence
-  - **Adaptive support thresholds**: Stricter requirements when combined with low SA tag fraction
-  - **Intra-chromosomal distance filtering**: Filters same-chromosome fusions <500KB apart
-  - **Gene family filtering**: Filters same-family genes (ZNF, GYP) and blacklisted prefixes (RPS, HLA, etc.)
-  - **Exon boundary check**: Filters breakpoints far from exon boundaries (>50bp) with low support/SA evidence (inspired by Factera/GeneFuse)
+- **High-Precision Filtering**: Advanced false-positive reduction through multiple global filters:
+  - Sink breakpoint detection (filters breakpoint regions appearing in many fusions)
+  - Breakpoint clustering and duplicate removal
+  - Repeating genes filter
+  - Low-confidence filtering
+  - Intra-chromosomal distance filtering
+  - Gene family and blacklist filtering
+  - Exon boundary validation
+  - Adaptive support/SA thresholds
 - **Breakpoint Refinement**: Uses reference FASTA to refine breakpoint positions by aligning soft-clipped sequences
 - **Parallel Processing**: Efficient multiprocessing support for both single and batch BAM processing
 - **Target Gene Filtering**: Optional focus on specific genes of interest
