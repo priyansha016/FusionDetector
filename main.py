@@ -1,13 +1,16 @@
 import argparse
+import hashlib
 import os
+import pickle
 import sys
 import glob
 import multiprocessing
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 import pysam
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from intervaltree import IntervalTree
 from utils.genome_index import GenomeIndex, load_exon_boundaries, get_nearest_exon_boundary
 from engine.discoverer import FusionDiscoverer, ReadLike, _read_to_dict
 from engine.assembler import FusionAssembler
@@ -20,6 +23,81 @@ from utils.hts_filter import install_hts_warning_filter
 install_hts_warning_filter()
 
 MIN_SUPPORT = 20  # require support >= 20 reads for all fusions
+
+
+class TimingProfiler:
+    """Track timing for different phases of processing."""
+    def __init__(self):
+        self.timings = {}
+        self.start_times = {}
+    
+    def start(self, phase):
+        """Start timing a phase."""
+        self.start_times[phase] = time.perf_counter()
+    
+    def stop(self, phase):
+        """Stop timing a phase and record duration."""
+        if phase in self.start_times:
+            duration = time.perf_counter() - self.start_times[phase]
+            if phase not in self.timings:
+                self.timings[phase] = []
+            self.timings[phase].append(duration)
+            del self.start_times[phase]
+            return duration
+        return 0.0
+    
+    def add(self, phase, duration):
+        """Add a timing measurement."""
+        if phase not in self.timings:
+            self.timings[phase] = []
+        self.timings[phase].append(duration)
+    
+    def get_summary(self):
+        """Get a summary of all timings."""
+        summary = {}
+        for phase, durations in self.timings.items():
+            summary[phase] = {
+                'total': sum(durations),
+                'count': len(durations),
+                'avg': sum(durations) / len(durations) if durations else 0.0,
+                'min': min(durations) if durations else 0.0,
+                'max': max(durations) if durations else 0.0
+            }
+        return summary
+    
+    def print_summary(self, sample_name, log_file=None):
+        """Write timing summary to log file only (no console output)."""
+        summary = self.get_summary()
+        if not summary:
+            return
+        
+        total_time = sum(s['total'] for s in summary.values())
+        if total_time == 0:
+            return
+        
+        if not log_file:
+            return
+        
+        lines = []
+        lines.append(f"\n=== TIMING SUMMARY ===")
+        lines.append(f"{'Phase':<30} {'Total (s)':>12} {'Avg (s)':>12} {'Count':>8} {'%':>8}")
+        lines.append(f"{'-'*70}")
+        
+        # Sort by total time descending
+        sorted_phases = sorted(summary.items(), key=lambda x: x[1]['total'], reverse=True)
+        
+        for phase, stats in sorted_phases:
+            pct = (stats['total'] / total_time * 100) if total_time > 0 else 0.0
+            count_str = f"{stats['count']}" if stats['count'] > 1 else "-"
+            lines.append(f"{phase:<30} {stats['total']:>12.2f} {stats['avg']:>12.4f} {count_str:>8} {pct:>7.1f}%")
+        
+        lines.append(f"{'-'*70}")
+        lines.append(f"{'TOTAL':<30} {total_time:>12.2f} {'':>12} {'':>8} {'100.0':>7}%")
+        lines.append(f"=== END TIMING SUMMARY ===\n")
+        
+        log_file.write("\n\n")
+        for line in lines:
+            log_file.write(line + "\n")
 
 
 class TraceLogger:
@@ -283,10 +361,15 @@ def _filter_breakpoint_clusters(results, user_targets=None, traced_pairs=None, t
     if not results or len(results) < 2:
         return results, []
     
-    # Cluster breakpoints within 10KB window
+    # Cluster breakpoints within 10KB window (spatial index: O(log n) lookup per fusion)
     CLUSTER_WINDOW = 10000
     bp_clusters = {}  # (chrom, cluster_pos) -> set of fusion indices
     fusion_list = list(results)  # Keep reference to original list
+    
+    # One interval tree per chromosome: interval [start, end) -> (cluster_key, insertion_order)
+    # So "first match" behavior is preserved (pick cluster with smallest insertion_order)
+    trees = defaultdict(IntervalTree)
+    cluster_order = [0]  # mutable so we can update in loop
     
     # Pre-normalize gene names once
     normalized_genes = {}
@@ -295,30 +378,39 @@ def _filter_breakpoint_clusters(results, user_targets=None, traced_pairs=None, t
         g_b = r.get("gene_b", "")
         normalized_genes[idx] = (_normalize_gene_name(g_a), _normalize_gene_name(g_b))
     
-    # First pass: build clusters (optimized - check existing clusters more efficiently)
+    # First pass: build clusters using interval tree (same logic, same order; O(n log n) instead of O(n^2))
     for idx, r in enumerate(fusion_list):
         bp_a = (r.get("chrom_a", ""), r.get("pos_a", 0))
         bp_b = (r.get("chrom_b", ""), r.get("pos_b", 0))
+        chrom_a, pos_a = bp_a
+        chrom_b, pos_b = bp_b
         
-        # Check both breakpoints for clustering
+        # Find existing cluster: query overlapping intervals (same "first match" as original dict iteration)
         assigned_cluster = None
         for chrom, pos in [bp_a, bp_b]:
-            # Find existing cluster - check only clusters for this chromosome
-            for cluster_key in bp_clusters.keys():
-                c, cluster_pos = cluster_key
-                if c == chrom and abs(pos - cluster_pos) <= CLUSTER_WINDOW:
-                    assigned_cluster = cluster_key
-                    break
-            
-            if assigned_cluster:
+            if not chrom or pos is None:
+                continue
+            overlapping = trees[chrom][pos]  # intervals containing this pos
+            if overlapping:
+                # Pick cluster with smallest insertion order (first created)
+                best = min(overlapping, key=lambda iv: iv.data[1])
+                assigned_cluster = best.data[0]
                 break
         
         if assigned_cluster:
-            # Add to existing cluster
             bp_clusters[assigned_cluster].add(idx)
         else:
-            # Create new cluster using bp_a as anchor
+            # Create new cluster using bp_a as anchor; add its range to the tree
             bp_clusters[bp_a] = {idx}
+            pos_anchor = pos_a if pos_a is not None else 0
+            order = cluster_order[0]
+            cluster_order[0] += 1
+            # Store [pos_anchor - 10kb, pos_anchor + 10kb] so any breakpoint in that range hits this cluster
+            trees[chrom_a].addi(
+                max(0, pos_anchor - CLUSTER_WINDOW),
+                pos_anchor + CLUSTER_WINDOW + 1,
+                (bp_a, order),
+            )
     
     # Filter clusters with >=2 fusions (stricter: clusters are strong FP signals)
     suspicious_clusters = {k: v for k, v in bp_clusters.items() if len(v) >= 2}
@@ -1079,10 +1171,70 @@ def _process_one_gene_pair(bam_path, fasta_path, ref_path, sample_name, gene_pai
                 pass
 
 
+def _get_cache_key(bam_path, ref_path, fasta_path, user_targets, min_support, min_mapq):
+    """Generate a cache key based on file paths, modification times, and parameters."""
+    # Get file modification times to detect changes
+    bam_mtime = os.path.getmtime(bam_path) if os.path.exists(bam_path) else 0
+    ref_mtime = os.path.getmtime(ref_path) if os.path.exists(ref_path) else 0
+    fasta_mtime = os.path.getmtime(fasta_path) if os.path.exists(fasta_path) else 0
+    
+    # Create hash from parameters
+    params_str = f"{bam_path}:{bam_mtime}:{ref_path}:{ref_mtime}:{fasta_path}:{fasta_mtime}:{sorted(user_targets) if user_targets else ()}:{min_support}:{min_mapq}"
+    cache_key = hashlib.md5(params_str.encode()).hexdigest()
+    return cache_key
+
+def _load_cache(cache_file):
+    """Load cached results if cache file exists and is valid."""
+    if not os.path.exists(cache_file):
+        return None
+    try:
+        with open(cache_file, 'rb') as f:
+            cache_data = pickle.load(f)
+        return cache_data
+    except Exception:
+        # Cache file corrupted or incompatible - ignore it
+        return None
+
+def _save_cache(cache_file, final_results, metadata):
+    """Save results to cache file."""
+    try:
+        cache_data = {
+            'results': final_results,
+            'metadata': metadata,
+            'timestamp': time.time()
+        }
+        with open(cache_file, 'wb') as f:
+            pickle.dump(cache_data, f)
+    except Exception:
+        # If caching fails, just continue without cache
+        pass
+
+
 def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_workers=1, min_mapq=20, use_process_discovery=False, min_support=None, traced_pairs=None):
     if min_support is None:
         min_support = MIN_SUPPORT
     sample_name = os.path.basename(bam_path).replace(".bam", "")
+    
+    # Initialize timing profiler
+    profiler = TimingProfiler()
+    profiler.start("total_processing")
+    
+    # Check cache first
+    cache_dir = os.path.join(output_dir, ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_key = _get_cache_key(bam_path, ref_path, fasta_path, user_targets, min_support, min_mapq)
+    cache_file = os.path.join(cache_dir, f"{sample_name}_{cache_key}.cache")
+    
+    cached_data = _load_cache(cache_file)
+    if cached_data is not None:
+        profiler.stop("total_processing")
+        print(f"[*] [{sample_name}] Using cached results (skipping processing)", flush=True)
+        final_results = cached_data['results']
+        # Still write output files (in case they were deleted)
+        out_file = os.path.join(output_dir, f"{sample_name}_fusions.tsv")
+        FusionReporter(out_file).save_tsv(final_results)
+        return f"[OK] {sample_name}: Found {len(final_results)} candidates (from cache)."
+    
     print(f"[*] Processing: {sample_name} (n_workers={n_workers}, min_support={min_support}, discovery={'processes' if use_process_discovery else 'threads'})", flush=True)
 
     # Create trace logger if tracing is enabled
@@ -1098,29 +1250,38 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
     filter_log_file = None
 
     try:
+        # Load indices and initialize components
+        profiler.start("index_loading")
         idx = GenomeIndex()
         idx.load_refflat(ref_path)
         # Load exon boundaries once for post-processing filter (only for final fusions)
         exon_boundaries = load_exon_boundaries(ref_path)
         validator = FusionValidator(fasta_path)
         discoverer = FusionDiscoverer(bam_path, idx, user_targets=user_targets, n_workers=n_workers, min_mapq=min_mapq, use_process_discovery=use_process_discovery)
-        t0 = time.perf_counter()
+        profiler.stop("index_loading")
+        
+        # Discovery phase
+        profiler.start("discovery")
         raw_candidates = discoverer.collect_seeds()
-        print(f"[*] [{sample_name}] Discovery done in {time.perf_counter() - t0:.1f}s ({len(raw_candidates)} gene pairs)", flush=True)
+        discovery_time = profiler.stop("discovery")
+        print(f"[*] [{sample_name}] Discovery done in {discovery_time:.1f}s ({len(raw_candidates)} gene pairs)", flush=True)
 
         # Build list of (gene_pair, reads_dicts) for pool workers; serialize reads to dicts for pickling
+        profiler.start("serialization")
         items = []
         for gene_pair, reads in raw_candidates.items():
             if not reads:
                 continue
             reads_dicts = [_serialize_read(r) for r in reads]
             items.append((bam_path, fasta_path, ref_path, sample_name, gene_pair, reads_dicts, tuple(user_targets) if user_targets else (), min_support, traced_pairs, trace_log_path))
+        profiler.stop("serialization")
 
         if not items:
             final_results = []
             # Still create filter log even if no items
             filter_log_file = open(filter_log_path, 'w')
             filter_log_file.write(f"# Filter Log for {sample_name}\n")
+            filter_log_file.write(f"# Command: {' '.join(sys.argv)}\n")
             filter_log_file.write(f"# Shows how many fusions pass/fail each filter\n\n")
             filter_log_file.write(f"Total gene pairs from discovery: {len(raw_candidates)}\n")
             filter_log_file.write(f"Total gene pairs processed (with reads): 0\n")
@@ -1160,7 +1321,8 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
                     final_results = [r for r in results if r is not None]
                     # Progress logged to filter log file only (no console spam)
                     # Validator summary goes to log file only
-                    print(f"[*] [{sample_name}] Assembly/validation done in {time.perf_counter() - t0:.1f}s ({validator_passed} passed, {validator_failed} failed)", flush=True)
+                    assembly_time = profiler.stop("assembly_validation")
+                    print(f"[*] [{sample_name}] Assembly/validation done in {assembly_time:.1f}s ({validator_passed} passed, {validator_failed} failed)", flush=True)
                     if validator_failed > 0 and validator_passed == 0:
                         print(f"[!] [{sample_name}] WARNING: All fusions failed validator! Use --trace to debug specific pairs.", flush=True)
                 else:
@@ -1168,6 +1330,7 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
                     n_workers_use = min(n_workers, len(items))
                     validator_passed = 0
                     validator_failed = 0
+                    profiler.start("assembly_validation")
                     with multiprocessing.Pool(n_workers_use) as pool:
                         results = []
                         for done, r in enumerate(pool.imap_unordered(_process_one_item, items, chunksize=1), 1):
@@ -1178,8 +1341,9 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
                                 validator_failed += 1
                             # Progress logged to filter log file only (no console spam)
                     final_results = [r for r in results if r is not None]
+                    assembly_time = profiler.stop("assembly_validation")
                     # Validator summary goes to log file only
-                    print(f"[*] [{sample_name}] Assembly/validation done in {time.perf_counter() - t0:.1f}s ({validator_passed} passed, {validator_failed} failed)", flush=True)
+                    print(f"[*] [{sample_name}] Assembly/validation done in {assembly_time:.1f}s ({validator_passed} passed, {validator_failed} failed)", flush=True)
                     if validator_failed > 0 and validator_passed == 0:
                         print(f"[!] WARNING: All fusions failed validator! Use --trace to debug specific pairs.", flush=True)
             else:
@@ -1188,6 +1352,7 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
                 validator_failed = 0
                 failure_reasons = {}  # Track why fusions are failing
                 sample_failures = []  # Store first 10 failure reasons for debugging
+                profiler.start("assembly_validation")
                 for i, args in enumerate(items):
                     r = _process_one_gene_pair(*args)
                     if r is not None:
@@ -1205,16 +1370,19 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
                             sample_failures.append(f"{g_a}-{g_b}")
                     # Progress logged to filter log file only (no console spam)
                 # Validator summary goes to log file only
-                print(f"[*] [{sample_name}] Assembly/validation done in {time.perf_counter() - t0:.1f}s ({validator_passed} passed, {validator_failed} failed)", flush=True)
+                assembly_time = profiler.stop("assembly_validation")
+                print(f"[*] [{sample_name}] Assembly/validation done in {assembly_time:.1f}s ({validator_passed} passed, {validator_failed} failed)", flush=True)
                 if sample_failures and validator_passed == 0:
                     print(f"[!] [{sample_name}] Sample failed gene pairs (first 10): {', '.join(sample_failures)}", flush=True)
                     print(f"[!] [{sample_name}] Use --trace to debug specific pairs, e.g., --trace {sample_failures[0]}", flush=True)
             
             # Post-process: global filters only (same thresholds for all samples)
             print(f"[*] [{sample_name}] Applying post-processing filters ({len(final_results)} fusions)...", flush=True)
+            profiler.start("post_processing")
             # Create filter log file to track what's being filtered
             filter_log_file = open(filter_log_path, 'w')
             filter_log_file.write(f"# Filter Log for {sample_name}\n")
+            filter_log_file.write(f"# Command: {' '.join(sys.argv)}\n")
             filter_log_file.write(f"# Shows how many fusions pass/fail each filter\n\n")
             filter_log_file.write(f"Validator summary: {validator_passed} passed, {validator_failed} failed (out of {total} gene pairs)\n\n")
             filter_log_file.write(f"Total gene pairs from discovery: {len(raw_candidates)}\n")
@@ -1222,58 +1390,86 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
             filter_log_file.write(f"Fusions passing validator (before post-processing): {len(final_results)}\n\n")
             
             filter_log_file.write(f"Before post-processing filters: {len(final_results)} fusions\n")
+            
+            # Time each filter individually
             before_count = len(final_results)
+            profiler.start("filter_gene_name_artifacts")
             final_results, filtered_names = _filter_gene_name_artifacts(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
+            profiler.stop("filter_gene_name_artifacts")
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After gene_name_artifacts: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
                 filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
+            
             before_count = len(final_results)
+            profiler.start("filter_deduplicate_aliases")
             final_results, filtered_names = _deduplicate_gene_aliases(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
+            profiler.stop("filter_deduplicate_aliases")
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After deduplicate_gene_aliases: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
                 filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
+            
             before_count = len(final_results)
+            profiler.start("filter_sink_breakpoints")
             final_results, filtered_names = _filter_sink_breakpoints(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
+            profiler.stop("filter_sink_breakpoints")
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After sink_breakpoints: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
                 filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
+            
             before_count = len(final_results)
+            profiler.start("filter_breakpoint_clusters")
             final_results, filtered_names = _filter_breakpoint_clusters(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
+            profiler.stop("filter_breakpoint_clusters")
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After breakpoint_clusters: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
                 filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
+            
             before_count = len(final_results)
+            profiler.start("filter_duplicate_breakpoints")
             final_results, filtered_names = _filter_duplicate_breakpoints(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
+            profiler.stop("filter_duplicate_breakpoints")
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After duplicate_breakpoints: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
                 filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
+            
             before_count = len(final_results)
+            profiler.start("filter_low_confidence")
             final_results, filtered_names = _filter_low_confidence(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
+            profiler.stop("filter_low_confidence")
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After low_confidence: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
                 filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
+            
             before_count = len(final_results)
+            profiler.start("filter_repeating_genes")
             final_results, filtered_names = _filter_repeating_genes(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
+            profiler.stop("filter_repeating_genes")
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After repeating_genes: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
                 filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
+            
             # Target gene quality filter: keep only high-quality target gene fusions
             before_count = len(final_results)
+            profiler.start("filter_target_gene_quality")
             final_results, filtered_names = _filter_target_gene_quality(final_results, user_targets, traced_pairs, trace_logger, filter_log_file)
+            profiler.stop("filter_target_gene_quality")
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After target_gene_quality: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
                 filter_log_file.write(f"  Filtered fusions: {', '.join(filtered_names)}\n")
+            
             # Exon boundary check: only check final fusions (post-processing, faster)
             before_count = len(final_results)
+            profiler.start("filter_exon_boundaries")
             final_results, filtered_names = _filter_exon_boundaries(final_results, exon_boundaries, user_targets, traced_pairs, trace_logger, filter_log_file)
+            profiler.stop("filter_exon_boundaries")
             removed_count = before_count - len(final_results)
             filter_log_file.write(f"After exon_boundaries: {len(final_results)} fusions (removed {removed_count})\n")
             if filtered_names:
@@ -1287,8 +1483,12 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
             filter_log_file.write(f"# - {total} gene pairs had reads and were processed\n")
             filter_log_file.write(f"# - Validator passed: {len(final_results)} fusions (before post-processing: {len(final_results) + sum([len(raw_candidates) - total, 0])})\n")
             filter_log_file.write(f"# - {len(final_results)} fusions passed validator and all post-processing filters\n")
-            filter_log_file.close()
+            profiler.stop("post_processing")
             print(f"[*] [{sample_name}] Post-processing done: {len(final_results)} fusions remaining", flush=True)
+            
+            # Write timing summary to log file (before closing)
+            profiler.print_summary(sample_name, log_file=filter_log_file)
+            filter_log_file.close()
             
             # Log final results for traced fusions
             if traced_pairs and trace_logger:
@@ -1299,8 +1499,27 @@ def process_sample(bam_path, ref_path, fasta_path, output_dir, user_targets, n_w
                     if ((g_a_norm, g_b_norm) in traced_pairs or (g_b_norm, g_a_norm) in traced_pairs):
                         trace_logger.log(f"[TRACE] {fusion_name}: ✓ REPORTED in final output")
 
+        # Write output files
+        profiler.start("file_io")
         out_file = os.path.join(output_dir, f"{sample_name}_fusions.tsv")
         FusionReporter(out_file).save_tsv(final_results)
+        
+        # Save to cache for next time
+        metadata = {
+            'sample_name': sample_name,
+            'bam_path': bam_path,
+            'ref_path': ref_path,
+            'fasta_path': fasta_path,
+            'min_support': min_support,
+            'min_mapq': min_mapq,
+            'user_targets': sorted(user_targets) if user_targets else None,
+        }
+        _save_cache(cache_file, final_results, metadata)
+        profiler.stop("file_io")
+        
+        # Stop total timing (summary already printed to log file)
+        profiler.stop("total_processing")
+        
         return f"[OK] {sample_name}: Found {len(final_results)} candidates."
 
     except Exception as e:
