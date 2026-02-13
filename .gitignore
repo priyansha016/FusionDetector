@@ -23,9 +23,7 @@ refFlat.txt.gz
 engine/sniffer.py
 
 # Local evaluation scripts and truth (optional to track)
-scripts/evaluate_fp_tp.py
-scripts/expected_fusions_all_samples.txt
-scripts/run_and_evaluate.sh
+scripts/
 
 # IDE
 .vscode/
